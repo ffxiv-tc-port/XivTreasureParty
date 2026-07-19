@@ -1,5 +1,5 @@
 {
-  "Author": "cycleapple",
+  "Author": "cycleapple, Lother",
   "Name": "XIV 藏寶圖工具小幫手",
   "InternalName": "XivTreasureParty",
   "Punchline": "繁中藏寶圖組隊協作，與網頁版即時共享同一個房間。",
@@ -7,5 +7,6 @@
   "ApplicableVersion": "any",
   "Tags": ["treasure", "map", "party", "zhTW", "Chinese"],
   "CategoryTags": ["utility"],
-  "RepoUrl": "https://github.com/cycleapple/xiv-party-treasure-helper"
+  "RepoUrl": "https://github.com/Lother/XivTreasureParty",
+  "IconUrl": "https://raw.githubusercontent.com/Lother/DalamudPluginsTC/main/icons/XivTreasureParty.png"
 }
