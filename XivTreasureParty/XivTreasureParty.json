@@ -7,6 +7,6 @@
   "ApplicableVersion": "any",
   "Tags": ["treasure", "map", "party", "zhTW", "Chinese"],
   "CategoryTags": ["utility"],
-  "RepoUrl": "https://github.com/Lother/XivTreasureParty",
-  "IconUrl": "https://raw.githubusercontent.com/Lother/DalamudPluginsTC/main/icons/XivTreasureParty.png"
+  "RepoUrl": "https://github.com/ffxiv-tc-port/XivTreasureParty",
+  "IconUrl": "https://raw.githubusercontent.com/ffxiv-tc-port/DalamudPluginsTC/main/icons/XivTreasureParty.png"
 }
