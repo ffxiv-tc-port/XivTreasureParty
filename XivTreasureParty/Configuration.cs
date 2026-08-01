@@ -34,5 +34,8 @@ public class Configuration : IPluginConfiguration
     /// </summary>
     public bool EnableMapLinkConversion { get; set; } = true;
 
+    /// <summary>發送藏寶圖座標時使用的聊天頻道指令，例如 /p 或 /cwl1。</summary>
+    public string TreasureChatCommand { get; set; } = "/p";
+
     public void Save() => Plugin.PluginInterface.SavePluginConfig(this);
 }

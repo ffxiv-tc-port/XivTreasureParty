@@ -13,11 +13,31 @@ public sealed class TreasureListPanel
     private string _editBuf = "";
     private int _editMode; // 0: none, 1: note, 2: player
     private bool _editJustStarted;
+    private string _chatCommandBuf;
+
+    public TreasureListPanel()
+    {
+        _chatCommandBuf = NormalizeChatCommand(Plugin.Config.TreasureChatCommand);
+    }
 
     public void Draw()
     {
         ImGui.TextUnformatted("藏寶圖清單");
         ImGui.Separator();
+
+        ImGui.AlignTextToFramePadding();
+        ImGui.TextUnformatted("發送頻道指令");
+        ImGui.SameLine();
+        ImGui.SetNextItemWidth(90f);
+        var commandCommitted = ImGui.InputText(
+            "##treasure-chat-command",
+            ref _chatCommandBuf,
+            16,
+            ImGuiInputTextFlags.EnterReturnsTrue);
+        if (commandCommitted || ImGui.IsItemDeactivatedAfterEdit())
+            SaveChatCommand();
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("藏寶圖座標的發送頻道，例如 /p（小隊）或 /cwl1（跨界通訊貝 1）");
 
         if (!Plugin.PartyService.IsInParty)
         {
@@ -159,10 +179,12 @@ public sealed class TreasureListPanel
 
         if (ImGui.SmallButton($"發送##send-{t.FirebaseKey}"))
         {
+            // 若玩家剛改完指令就直接按發送，先提交目前輸入值，避免這次仍使用舊頻道。
+            SaveChatCommand();
             SendTreasureToChat(t);
         }
         if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("以 /p 發送『地圖 ( X , Y )』到小隊頻道，含可點擊的地圖連結");
+            ImGui.SetTooltip($"以 {NormalizeChatCommand(Plugin.Config.TreasureChatCommand)} 發送『地圖 ( X , Y )』，含可點擊的地圖連結");
         ImGui.SameLine();
 
         if (ImGui.SmallButton($"刪除##rm-{t.FirebaseKey}"))
@@ -170,7 +192,7 @@ public sealed class TreasureListPanel
     }
 
     /// <summary>
-    /// 對應網頁版 copyPlayerMessage，以 /p 送到小隊頻道。**純文字座標** —
+    /// 對應網頁版 copyPlayerMessage，以玩家設定的頻道指令發送。**純文字座標** —
     /// 含一個保險的 PreMapLinkPayload 在文字後面（給有裝 AutoConvertMapLink
     /// 等接收端 rewrite 工具的玩家可點），但即使 payload 被 input
     /// sanitizer 剝掉，文字部分的座標一定看得到。
@@ -195,7 +217,8 @@ public sealed class TreasureListPanel
             // 在「chunk 被 input sanitizer 吃掉」的情況下仍能把文字轉成可點連結。
             // 接收端 hook 偵測到 chunk 已存在時會把多餘的純文字模式吃掉避免重複顯示。
             var sb = new Dalamud.Game.Text.SeStringHandling.SeStringBuilder();
-            sb.AddText($"/p {player}{mapName} ( {t.Coords.X:0.0}  , {t.Coords.Y:0.0} )");
+            var chatCommand = NormalizeChatCommand(Plugin.Config.TreasureChatCommand);
+            sb.AddText($"{chatCommand} {player}{mapName} ( {t.Coords.X:0.0}  , {t.Coords.Y:0.0} )");
             if (preLink != null)
                 sb.Add(preLink);
             if (aetheryte != null)
@@ -207,6 +230,32 @@ public sealed class TreasureListPanel
         {
             Plugin.Log.Error(ex, "[SendTreasure] 發送聊天失敗");
         }
+    }
+
+    private void SaveChatCommand()
+    {
+        _chatCommandBuf = NormalizeChatCommand(_chatCommandBuf);
+        if (Plugin.Config.TreasureChatCommand == _chatCommandBuf)
+            return;
+
+        Plugin.Config.TreasureChatCommand = _chatCommandBuf;
+        Plugin.Config.Save();
+    }
+
+    private static string NormalizeChatCommand(string? command)
+    {
+        command = command?.Trim();
+        if (string.IsNullOrEmpty(command))
+            return "/p";
+
+        var firstWhitespace = command.IndexOfAny(new[] { ' ', '\t', '\r', '\n' });
+        if (firstWhitespace >= 0)
+            command = command[..firstWhitespace];
+
+        if (!command.StartsWith("/", StringComparison.Ordinal))
+            command = "/" + command;
+
+        return command.Length > 1 ? command : "/p";
     }
 
     private void CommitPlayer(Treasure t)
