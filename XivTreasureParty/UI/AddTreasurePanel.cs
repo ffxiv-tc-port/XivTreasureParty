@@ -164,15 +164,16 @@ public sealed class AddTreasurePanel
         }
         if (ImGui.IsItemHovered())
             ImGui.SetTooltip("偵測到玩家解碼新藏寶圖時自動幫你填好下方欄位（仍需按『加入清單』才推送）");
-        ImGui.SameLine();
+
         var autoOpen = Plugin.Config.AutoOpenMapOnCapture;
-        if (ImGui.Checkbox("同時打旗標", ref autoOpen))
+        if (ImGui.Checkbox("開圖後自動開啟地圖並設定旗標", ref autoOpen))
         {
             Plugin.Config.AutoOpenMapOnCapture = autoOpen;
             Plugin.Config.Save();
+            if (autoOpen) Plugin.HuntAutoCapture.Reset();
         }
         if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("讀取/偵測到藏寶圖時，同時在遊戲內開地圖並打旗標");
+            ImGui.SetTooltip("偵測到玩家解碼新藏寶圖後，自動開啟對應地圖並把旗標設在寶藏位置；不需要同時開啟自動選取");
 
         ImGui.Spacing();
     }

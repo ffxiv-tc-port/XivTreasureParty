@@ -25,7 +25,7 @@ public class Configuration : IPluginConfiguration
     /// <summary>自動偵測玩家解碼藏寶圖時預選下方新增欄位（不會直接推送，需手動按加入清單）。</summary>
     public bool AutoCaptureOnDecode { get; set; } = true;
 
-    /// <summary>讀取/自動偵測到新藏寶圖時，順便在遊戲內開啟地圖並打旗標。</summary>
+    /// <summary>偵測到玩家解碼新藏寶圖時，自動開啟對應地圖並在寶藏位置設定旗標。</summary>
     public bool AutoOpenMapOnCapture { get; set; } = false;
 
     /// <summary>
