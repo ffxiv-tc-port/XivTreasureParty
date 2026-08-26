@@ -18,6 +18,10 @@ public sealed class Plugin : IDalamudPlugin
     public static IDalamudPluginInterface PluginInterface { get; private set; } = null!;
     public static ICommandManager CommandManager { get; private set; } = null!;
     public static IClientState ClientState { get; private set; } = null!;
+
+    // API13 把 IClientState.LocalPlayer 標為過時，替代品是 IObjectTable.LocalPlayer。
+    // Dalamud 端 ClientState.LocalPlayer 本身就是 => this.objectTable.LocalPlayer 的純轉發。
+    public static IObjectTable ObjectTable { get; private set; } = null!;
     public static IDataManager DataManager { get; private set; } = null!;
     public static IPluginLog Log { get; private set; } = null!;
     public static IChatGui ChatGui { get; private set; } = null!;
@@ -50,11 +54,13 @@ public sealed class Plugin : IDalamudPlugin
         IChatGui chatGui,
         IFramework framework,
         IGameInteropProvider gameInterop,
-        IGameGui gameGui)
+        IGameGui gameGui,
+        IObjectTable objectTable)
     {
         PluginInterface = pluginInterface;
         CommandManager = commandManager;
         ClientState = clientState;
+        ObjectTable = objectTable;
         DataManager = dataManager;
         Log = pluginLog;
         ChatGui = chatGui;

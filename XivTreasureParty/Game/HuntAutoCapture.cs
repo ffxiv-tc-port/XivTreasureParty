@@ -5,9 +5,9 @@ namespace XivTreasureParty.Game;
 
 /// <summary>
 /// 每個 framework tick 輪詢 TreasureHuntManager 的 rank+spot，偵測到變化就：
-///   1. 呼叫 AddTreasurePanel.ApplyDecoded 預選欄位
-///   2. 若 Config.AutoOpenMapOnCapture，也直接在遊戲內打旗標
-/// 僅在 Config.AutoCaptureOnDecode 開啟時才運作。不會自動推送到 Firebase。
+///   1. 若 Config.AutoCaptureOnDecode，呼叫 AddTreasurePanel.ApplyDecoded 預選欄位
+///   2. 若 Config.AutoOpenMapOnCapture，在遊戲內開啟對應地圖並打旗標
+/// 兩個選項彼此獨立；只要其中一項開啟就會偵測。不會自動推送到 Firebase。
 /// </summary>
 public sealed class HuntAutoCapture : IDisposable
 {
@@ -31,7 +31,7 @@ public sealed class HuntAutoCapture : IDisposable
     private void OnUpdate(IFramework framework)
     {
         if (_running) return;
-        if (!Plugin.Config.AutoCaptureOnDecode) return;
+        if (!Plugin.Config.AutoCaptureOnDecode && !Plugin.Config.AutoOpenMapOnCapture) return;
         if (!Plugin.HuntReader.IsAvailable) return;
 
         var now = DateTime.UtcNow;
@@ -58,7 +58,8 @@ public sealed class HuntAutoCapture : IDisposable
             var decoded = Plugin.HuntReader.Resolve(rank, spot);
             if (decoded == null) return;
 
-            Plugin.Window.AddPanel.ApplyDecoded(decoded);
+            if (Plugin.Config.AutoCaptureOnDecode)
+                Plugin.Window.AddPanel.ApplyDecoded(decoded);
 
             if (Plugin.Config.AutoOpenMapOnCapture)
             {

@@ -25,7 +25,7 @@ public class Configuration : IPluginConfiguration
     /// <summary>自動偵測玩家解碼藏寶圖時預選下方新增欄位（不會直接推送，需手動按加入清單）。</summary>
     public bool AutoCaptureOnDecode { get; set; } = true;
 
-    /// <summary>讀取/自動偵測到新藏寶圖時，順便在遊戲內開啟地圖並打旗標。</summary>
+    /// <summary>偵測到玩家解碼新藏寶圖時，自動開啟對應地圖並在寶藏位置設定旗標。</summary>
     public bool AutoOpenMapOnCapture { get; set; } = false;
 
     /// <summary>
@@ -33,6 +33,9 @@ public class Configuration : IPluginConfiguration
     /// 等同 DailyRoutines AutoConvertMapLink 的功能；兩者並存沒問題（idempotent，只有第一個會作用）。
     /// </summary>
     public bool EnableMapLinkConversion { get; set; } = true;
+
+    /// <summary>發送藏寶圖座標時使用的聊天頻道指令，例如 /p 或 /cwl1。</summary>
+    public string TreasureChatCommand { get; set; } = "/p";
 
     public void Save() => Plugin.PluginInterface.SavePluginConfig(this);
 }

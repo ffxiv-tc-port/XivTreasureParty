@@ -88,7 +88,7 @@ public sealed unsafe class MapLinkAutoConverter : IDisposable
 
     private nint ParseMessageDetour(nint a, nint b)
     {
-        var ret = _hook!.Original(a, b);
+        var ret = _hook!.OriginalDisposeSafe(a, b);
         if (!Plugin.Config.EnableMapLinkConversion) return ret;
 
         try
