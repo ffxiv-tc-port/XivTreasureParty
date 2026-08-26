@@ -37,5 +37,11 @@ public class Configuration : IPluginConfiguration
     /// <summary>發送藏寶圖座標時使用的聊天頻道指令，例如 /p 或 /cwl1。</summary>
     public string TreasureChatCommand { get; set; } = "/p";
 
+    /// <summary>
+    /// 把隊伍清單裡「全部」尚未完成的藏寶點畫到 Mappy 的地圖上（透過 Mappy 的標記 IPC）。
+    /// 沒裝 Mappy 時這個開關不做任何事；原本的「地圖」按鈕（開圖打旗標）不受影響。
+    /// </summary>
+    public bool ShowTreasuresOnMappy { get; set; } = true;
+
     public void Save() => Plugin.PluginInterface.SavePluginConfig(this);
 }

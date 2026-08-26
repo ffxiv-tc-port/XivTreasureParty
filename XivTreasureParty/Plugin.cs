@@ -42,6 +42,7 @@ public sealed class Plugin : IDalamudPlugin
     public static TreasureHuntReader HuntReader { get; private set; } = null!;
     public static HuntAutoCapture HuntAutoCapture { get; private set; } = null!;
     public static MapLinkAutoConverter MapLinkAutoConverter { get; private set; } = null!;
+    public static MappyMarkerBridge MappyMarkers { get; private set; } = null!;
 
     public static PluginWindow Window { get; private set; } = null!;
 
@@ -80,6 +81,7 @@ public sealed class Plugin : IDalamudPlugin
         HuntReader = new TreasureHuntReader(gameInterop);
         HuntAutoCapture = new HuntAutoCapture(framework);
         MapLinkAutoConverter = new MapLinkAutoConverter(gameInterop);
+        MappyMarkers = new MappyMarkerBridge(framework, SyncService);
 
         Window = new PluginWindow();
         PluginInterface.UiBuilder.Draw += Window.Draw;
@@ -127,6 +129,7 @@ public sealed class Plugin : IDalamudPlugin
 
     public void Dispose()
     {
+        try { MappyMarkers.Dispose(); } catch { }
         try { MapLinkAutoConverter.Dispose(); } catch { }
         try { HuntAutoCapture.Dispose(); } catch { }
         try { Heartbeat.Stop(); } catch { }

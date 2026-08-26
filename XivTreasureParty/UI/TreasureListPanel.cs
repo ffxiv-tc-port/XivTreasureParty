@@ -39,6 +39,18 @@ public sealed class TreasureListPanel
         if (ImGui.IsItemHovered())
             ImGui.SetTooltip("藏寶圖座標的發送頻道，例如 /p（小隊）或 /cwl1（跨界通訊貝 1）");
 
+        var showOnMappy = Plugin.Config.ShowTreasuresOnMappy;
+        if (ImGui.Checkbox("藏寶圖標到 Mappy 地圖", ref showOnMappy))
+        {
+            Plugin.Config.ShowTreasuresOnMappy = showOnMappy;
+            Plugin.Config.Save();
+            Plugin.MappyMarkers.MarkDirty();
+        }
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("把清單裡尚未完成的藏寶點「全部」畫到 Mappy 的地圖上（不只一個旗標）。\n"
+                             + "需要安裝 Mappy；沒裝時這個選項不會有任何作用，原本的『地圖』按鈕照舊。\n"
+                             + "標記可以在 Mappy 的設定裡以來源「XivTreasureParty」單獨關掉。");
+
         if (!Plugin.PartyService.IsInParty)
         {
             ImGui.TextDisabled("加入隊伍後會在此顯示同步的藏寶圖");
