@@ -16,7 +16,7 @@ FFXIV 繁體中文服的寶物地圖協作 Dalamud 插件。與網頁版 [xiv-tc
 
 ## 安裝
 
-1. 安裝 [XIVTCLauncher](https://github.com/cycleapple/XIVTCLauncher)
+1. 安裝 [XIVTCLauncher](https://github.com/ffxiv-tc-port/XIVTCLauncher)
 2. 遊戲中輸入 `/xlsettings` 開啟 Dalamud 設定
 3. 到「實驗性功能」的分頁
 4. 找到「自定義插件倉庫」區塊，輸入：
