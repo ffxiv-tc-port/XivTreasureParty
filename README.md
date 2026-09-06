@@ -21,7 +21,7 @@ FFXIV 繁體中文服的寶物地圖協作 Dalamud 插件。與網頁版 [xiv-tc
 3. 到「實驗性功能」的分頁
 4. 找到「自定義插件倉庫」區塊，輸入：
    ```
-   https://raw.githubusercontent.com/cycleapple/xiv-party-treasure-helper/main/repo.json
+   https://raw.githubusercontent.com/ffxiv-tc-port/DalamudPluginsTC/main/repo.json
    ```
 5. 按下「+」並儲存
 
