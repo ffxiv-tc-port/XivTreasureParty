@@ -1,6 +1,6 @@
 {
   "Author": "cycleapple",
-  "Name": "XIV 藏寶圖工具小幫手",
+  "Name": "XIV 寶物地圖工具小幫手",
   "InternalName": "XivTreasureParty",
   "Punchline": "繁中寶物地圖組隊協作，與網頁版即時共享同一個房間。",
   "Description": "Dalamud 插件版本的 FFXIV 繁中寶物地圖工具小幫手。可與網頁版（https://cycleapple.github.io/xiv-tc-treasure-finder/）使用者混合組隊，即時同步同一份清單。支援建立/加入房間、手動新增寶物地圖、打開寶物地圖時自動選取、遊戲內開地圖打旗標、以自訂頻道指令（例如 /p 或 /cwl1）發送可點擊地圖連結、順序調整、完成勾選等。另外若有安裝 Mappy，可把隊伍清單裡尚未完成的藏寶點「全部」同時畫到 Mappy 的地圖上（不只一次一個旗標）。",
