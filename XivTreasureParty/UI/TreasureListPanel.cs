@@ -68,6 +68,8 @@ public sealed class TreasureListPanel
             return;
         }
 
+        DrawRouteControls(treasures);
+
         if (ImGui.BeginTable("##treasures", 6,
             ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH | ImGuiTableFlags.ScrollY | ImGuiTableFlags.SizingStretchProp))
         {
@@ -76,7 +78,7 @@ public sealed class TreasureListPanel
             ImGui.TableSetupColumn("地點 / 座標", ImGuiTableColumnFlags.WidthStretch, 2f);
             ImGui.TableSetupColumn("負責玩家", ImGuiTableColumnFlags.WidthStretch, 1.2f);
             ImGui.TableSetupColumn("備註", ImGuiTableColumnFlags.WidthStretch, 1.2f);
-            ImGui.TableSetupColumn("操作", ImGuiTableColumnFlags.WidthFixed, 260f);
+            ImGui.TableSetupColumn("操作", ImGuiTableColumnFlags.WidthFixed, 320f);
             ImGui.TableHeadersRow();
 
             for (var i = 0; i < treasures.Count; i++)
@@ -89,10 +91,14 @@ public sealed class TreasureListPanel
     private void DrawRow(System.Collections.Generic.List<Treasure> list, int index)
     {
         var t = list[index];
+        var navStatus = TreasureNavigator.GetStatus();
         ImGui.TableNextRow();
 
         ImGui.TableNextColumn();
-        ImGui.TextUnformatted(t.Order.ToString());
+        var navigatingHere = navStatus.Busy == true && TreasureNavigator.NavigatingKey == t.FirebaseKey;
+        ImGui.TextUnformatted(navigatingHere ? "→" + t.Order : t.Order.ToString());
+        if (navigatingHere && ImGui.IsItemHovered())
+            ImGui.SetTooltip("Lifestream 正在前往這一筆");
 
         ImGui.TableNextColumn();
         var grade = GradeData.GetByItemId(t.GradeItemId);
@@ -189,6 +195,15 @@ public sealed class TreasureListPanel
             ImGui.SetTooltip("在遊戲內開啟地圖並將旗標設在藏寶點");
         ImGui.SameLine();
 
+        var canNavigate = navStatus.LifestreamAvailable && navStatus.Busy != true && !t.Completed;
+        if (!canNavigate) ImGui.BeginDisabled();
+        if (ImGui.SmallButton("前往##go-" + t.FirebaseKey))
+            TreasureNavigator.TryGoTo(t);
+        if (!canNavigate) ImGui.EndDisabled();
+        if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+            ImGui.SetTooltip(NavigateTooltip(navStatus, t));
+        ImGui.SameLine();
+
         if (ImGui.SmallButton($"發送##send-{t.FirebaseKey}"))
         {
             // 若玩家剛改完指令就直接按發送，先提交目前輸入值，避免這次仍使用舊頻道。
@@ -201,6 +216,70 @@ public sealed class TreasureListPanel
 
         if (ImGui.SmallButton($"刪除##rm-{t.FirebaseKey}"))
             _ = Plugin.PartyService.RemoveTreasureAsync(t.FirebaseKey);
+    }
+
+    /// <summary>
+    /// 清單上方的路線控制列：一鍵前往「依目前排序的下一個未完成藏寶點」。
+    /// </summary>
+    /// <remarks>
+    /// 🔴 順序沿用清單上看到的排序（已完成的排最後，其餘依 <c>order</c>），
+    /// 而 <c>order</c> 正是「優化路線」用 <see cref="Party.RouteOptimizer"/> 寫回去的那一份
+    /// ——所以「下一個」永遠是使用者在畫面上看到的下一列，不會偷偷走另一條路線。
+    /// 🔴 只有按下去才會動，沒有任何自動接手；也不會幫忙開寶箱或打怪。
+    /// </remarks>
+    private static void DrawRouteControls(System.Collections.Generic.List<Treasure> treasures)
+    {
+        var status = TreasureNavigator.GetStatus();
+        var next = treasures.FirstOrDefault(x => !x.Completed);
+
+        var canGo = status.LifestreamAvailable && status.Busy != true && next != null;
+        if (!canGo) ImGui.BeginDisabled();
+        if (ImGui.Button("依路線前往下一個") && next != null)
+            TreasureNavigator.TryGoTo(next);
+        if (!canGo) ImGui.EndDisabled();
+        if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+            ImGui.SetTooltip(NavigateTooltip(status, next));
+        ImGui.SameLine();
+
+        var fly = Plugin.Config.NavigateWithFlight;
+        if (ImGui.Checkbox("允許飛行", ref fly))
+        {
+            Plugin.Config.NavigateWithFlight = fly;
+            Plugin.Config.Save();
+        }
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("最後一段路允許使用飛行坐騎。\n區域不可飛、或還沒解鎖飛行時，Lifestream 會自動改用走的。");
+        ImGui.SameLine();
+
+        // 「不知道」要在列上看得見：問不到 Lifestream 狀態時畫灰字的問號，不要畫成「就緒」。
+        ImGui.AlignTextToFramePadding();
+        if (!status.LifestreamAvailable)
+            ImGui.TextDisabled("需要 Lifestream");
+        else if (status.Busy == true)
+            ImGui.TextDisabled("移動中…");
+        else if (status.Busy == null)
+            ImGui.TextDisabled("狀態 ?");
+        else
+            ImGui.TextDisabled("可出發");
+    }
+
+    /// <summary>「前往」按鈕的 tooltip：能按時說要去哪，不能按時說為什麼。</summary>
+    private static string NavigateTooltip(TreasureNavigator.NavStatus status, Treasure? target)
+    {
+        if (!status.LifestreamAvailable)
+            return "需要 Lifestream\n請先安裝並啟用 Lifestream（實際走路／飛行由 vnavmesh 負責）。";
+        if (target == null)
+            return "清單上沒有未完成的藏寶點";
+        if (target.Completed)
+            return "這一筆已經標記完成了";
+        if (status.Busy == true)
+            return "Lifestream 正在移動中，等它抵達之後再按";
+
+        var line = $"傳送並移動到 {MapData.GetMapName(target.MapId)} ( {target.Coords.X:0.0} , {target.Coords.Y:0.0} )。\n"
+                   + "只把人送過去，不會自動開寶箱、不會自動戰鬥。";
+        if (status.Busy == null)
+            line += "\n（問不到 Lifestream 目前狀態；按下去若被拒絕，稍後再試一次。）";
+        return line;
     }
 
     /// <summary>

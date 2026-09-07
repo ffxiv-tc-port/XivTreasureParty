@@ -43,5 +43,11 @@ public class Configuration : IPluginConfiguration
     /// </summary>
     public bool ShowTreasuresOnMappy { get; set; } = true;
 
+    /// <summary>
+    /// 按「前往」時允許 Lifestream 用飛行坐騎跑最後一段。
+    /// 區域不可飛、或還沒解鎖飛行時，Lifestream 會自動退回地面路線，不會因此失敗。
+    /// </summary>
+    public bool NavigateWithFlight { get; set; } = true;
+
     public void Save() => Plugin.PluginInterface.SavePluginConfig(this);
 }
