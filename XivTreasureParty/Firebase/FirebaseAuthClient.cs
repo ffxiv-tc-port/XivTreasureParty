@@ -52,7 +52,14 @@ public sealed class FirebaseAuthClient : IDisposable
         await _mutex.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            if (IsSignedIn && DateTime.UtcNow < TokenExpiresAtUtc - TimeSpan.FromMinutes(2))
+            // 🔴 這裡刻意不寫成 TokenExpiresAtUtc - TimeSpan.FromMinutes(2)：
+            //    InvalidateToken() 會把 TokenExpiresAtUtc 設成 DateTime.MinValue，而建構子在
+            //    設定檔沒有 LastTokenRefreshedAtUtc 時也會給 MinValue；對 MinValue 做減法會直接擲
+            //    ArgumentOutOfRangeException（un-representable DateTime）。
+            //    這是認證的第一道判斷，炸在這裡等於建立隊伍／加入隊伍／心跳／串流重連全部失效。
+            //    2026-09-08 實機踩到：v7.20.0.12 出貨後使用者完全無法建隊或加入。
+            //    改用加法形式，語意完全等價（a < b - c  ⟺  b > a + c），而 UtcNow + 2 分鐘不可能溢位。
+            if (IsSignedIn && TokenExpiresAtUtc > DateTime.UtcNow + TimeSpan.FromMinutes(2))
                 return IdToken!;
 
             if (!string.IsNullOrEmpty(RefreshToken))
