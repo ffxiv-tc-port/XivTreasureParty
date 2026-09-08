@@ -14,11 +14,13 @@ public sealed class SyncService
 {
     private readonly FirebaseStreamClient _stream;
 
-    private IDisposable? _membersSub;
-    private IDisposable? _treasuresSub;
-    private IDisposable? _metaSub;
+    private FirebaseStreamClient.StreamSubscription? _membersSub;
+    private FirebaseStreamClient.StreamSubscription? _treasuresSub;
+    private FirebaseStreamClient.StreamSubscription? _metaSub;
 
     private string? _currentCode;
+
+    private DateTime _lastManualReconnectUtc = DateTime.MinValue;
 
     public Dictionary<string, PartyMember> Members { get; } = new();
     public Dictionary<string, Treasure> Treasures { get; } = new();
@@ -81,6 +83,96 @@ public sealed class SyncService
         Treasures.Clear();
         Meta = null;
         _currentCode = null;
+    }
+
+    /// <summary>目前訂閱中的隊伍代碼（沒訂閱時為 null）。</summary>
+    public string? CurrentCode => _currentCode;
+
+    /// <summary>
+    /// 把三條串流的狀態聚合成一列給 UI 用。在繪製執行緒呼叫；
+    /// 每條串流的狀態都是背景執行緒整體指派的不可變快照，讀到的一定是完整的一份。
+    /// </summary>
+    public SyncConnectionInfo GetConnectionInfo()
+    {
+        var subs = new[] { _membersSub, _treasuresSub, _metaSub };
+        var info = new SyncConnectionInfo { Total = 0, Connected = 0, State = StreamConnectionState.Idle };
+
+        var anyStopped = false;
+        var anyReconnecting = false;
+        var anyConnecting = false;
+
+        foreach (var sub in subs)
+        {
+            if (sub == null) continue;
+            var st = sub.Status;
+            info.Total++;
+
+            switch (st.State)
+            {
+                case StreamConnectionState.Connected: info.Connected++; break;
+                case StreamConnectionState.Reconnecting: anyReconnecting = true; break;
+                case StreamConnectionState.Connecting: anyConnecting = true; break;
+                case StreamConnectionState.Stopped: anyStopped = true; break;
+            }
+
+            if (st.FailedAttempts > info.FailedAttempts) info.FailedAttempts = st.FailedAttempts;
+
+            if (st.NextRetryUtc is { } next && (info.NextRetryUtc == null || next < info.NextRetryUtc))
+                info.NextRetryUtc = next;
+
+            if (st.LastEventUtc is { } le && (info.LastEventUtc == null || le > info.LastEventUtc))
+                info.LastEventUtc = le;
+
+            if (info.LastError == null && st.State != StreamConnectionState.Connected)
+                info.LastError = st.LastError;
+        }
+
+        if (info.Total == 0)
+            info.State = StreamConnectionState.Idle;
+        else if (anyStopped)
+            info.State = StreamConnectionState.Stopped;
+        else if (anyReconnecting)
+            info.State = StreamConnectionState.Reconnecting;
+        else if (info.Connected == info.Total)
+            info.State = StreamConnectionState.Connected;
+        else if (anyConnecting)
+            info.State = StreamConnectionState.Connecting;
+        else
+            info.State = StreamConnectionState.Idle;
+
+        return info;
+    }
+
+    /// <summary>
+    /// 手動重新連線：三條串流各插隊一次立刻重試（不等退避）。
+    /// 訂閱整個不見時（例如重連迴圈曾經停掉、或啟動時沒接上）則重新建立訂閱。
+    /// 自帶 3 秒節流，避免使用者連點變成每幀重試。
+    /// </summary>
+    public bool ReconnectNow()
+    {
+        var now = DateTime.UtcNow;
+        if (now - _lastManualReconnectUtc < TimeSpan.FromSeconds(3)) return false;
+        _lastManualReconnectUtc = now;
+
+        var code = _currentCode ?? Plugin.PartyService.CurrentPartyCode;
+        if (string.IsNullOrWhiteSpace(code))
+        {
+            Plugin.Log.Information("[Sync] 手動重新連線：目前不在任何隊伍中，沒有東西可以連。");
+            return false;
+        }
+
+        if (_membersSub == null || _treasuresSub == null || _metaSub == null)
+        {
+            Plugin.Log.Information($"[Sync] 手動重新連線：訂閱不存在，重新建立三條串流（隊伍 {code}）。");
+            Start(code!);
+            return true;
+        }
+
+        Plugin.Log.Information($"[Sync] 手動重新連線：要求三條串流立刻重試（隊伍 {code}）。");
+        _membersSub.RequestImmediateRetry();
+        _treasuresSub.RequestImmediateRetry();
+        _metaSub.RequestImmediateRetry();
+        return true;
     }
 
     /// <summary>
@@ -308,4 +400,27 @@ public sealed class SyncService
         Plugin.PartyService.SetOrderLocked(Meta?.OrderLocked ?? false);
         MetaChanged?.Invoke();
     }
+}
+
+/// <summary>三條串流聚合後的連線狀態，只給 UI 顯示用。</summary>
+public sealed class SyncConnectionInfo
+{
+    public StreamConnectionState State { get; set; } = StreamConnectionState.Idle;
+
+    /// <summary>三條串流裡最高的連續失敗次數。</summary>
+    public int FailedAttempts { get; set; }
+
+    /// <summary>最快的一條下次重試的時刻。</summary>
+    public DateTime? NextRetryUtc { get; set; }
+
+    /// <summary>最後一次收到資料的時刻。null＝從來沒收過（畫面上要顯示成「?」而不是 0）。</summary>
+    public DateTime? LastEventUtc { get; set; }
+
+    public string? LastError { get; set; }
+
+    /// <summary>目前有幾條串流。</summary>
+    public int Total { get; set; }
+
+    /// <summary>其中連上的有幾條。</summary>
+    public int Connected { get; set; }
 }

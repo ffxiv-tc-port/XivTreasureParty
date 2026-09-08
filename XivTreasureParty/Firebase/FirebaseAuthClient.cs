@@ -36,6 +36,17 @@ public sealed class FirebaseAuthClient : IDisposable
         }
     }
 
+    /// <summary>
+    /// 把快取的憑證標記為過期，讓下一次 EnsureSignedInAsync 一定重新取得。
+    /// 伺服器回報 auth_revoked 時必須呼叫：本地記的到期時間只是「上次刷新時間 + 55 分」的估算，
+    /// 伺服器已經不認這顆時，沿用同一顆重連只會無限重試同一個失敗。
+    /// </summary>
+    public void InvalidateToken()
+    {
+        // 只是一個 DateTime 欄位的整體指派，讀寫兩端都不會看到寫到一半的值。
+        TokenExpiresAtUtc = DateTime.MinValue;
+    }
+
     public async Task<string> EnsureSignedInAsync(CancellationToken ct = default)
     {
         await _mutex.WaitAsync(ct).ConfigureAwait(false);
