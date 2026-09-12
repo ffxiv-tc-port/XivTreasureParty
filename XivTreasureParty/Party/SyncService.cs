@@ -59,6 +59,10 @@ public sealed class SyncService
 
     private static void RunSafeOnFrameworkThread(Action action, string scope)
     {
+        // 卸載窗內轉派會就地在 SSE 的執行緒上跑，那時改 snapshot 或觸發 UI 回調都不安全。
+        if (FrameworkUnloadGuard.ShouldSkip(scope))
+            return;
+
         // 包一層 try/catch + 觀察 Task exception，避免 unobserved exception 終結整個 SSE callback。
         Plugin.Framework.RunOnFrameworkThread(() =>
         {
@@ -182,6 +186,10 @@ public sealed class SyncService
     /// </summary>
     public void UpsertTreasureLocal(string key, Treasure t)
     {
+        // 呼叫端在 await 之後的執行緒池上。
+        if (FrameworkUnloadGuard.ShouldSkip("本地新增藏寶圖"))
+            return;
+
         Plugin.Framework.RunOnFrameworkThread(() =>
         {
             t.FirebaseKey = key;
@@ -193,6 +201,9 @@ public sealed class SyncService
     /// <summary>同上，刪除時也補一個本地刪除（remove 在 SSE 醒來前不會出現）。</summary>
     public void RemoveTreasureLocal(string key)
     {
+        if (FrameworkUnloadGuard.ShouldSkip("本地刪除藏寶圖"))
+            return;
+
         Plugin.Framework.RunOnFrameworkThread(() =>
         {
             if (Treasures.Remove(key))
@@ -203,6 +214,9 @@ public sealed class SyncService
     /// <summary>給 PartyService 在批次本機更新 order 後通知 UI 重畫。</summary>
     public void NotifyTreasuresChanged()
     {
+        if (FrameworkUnloadGuard.ShouldSkip("藏寶圖清單通知"))
+            return;
+
         Plugin.Framework.RunOnFrameworkThread(() => TreasuresChanged?.Invoke());
     }
 
