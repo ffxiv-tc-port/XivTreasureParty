@@ -1,6 +1,6 @@
 using System;
 using System.Linq;
-using ImGuiNET;
+using Dalamud.Bindings.ImGui;
 using XivTreasureParty.Data;
 using XivTreasureParty.Game;
 using XivTreasureParty.Party.Models;
@@ -13,11 +13,43 @@ public sealed class TreasureListPanel
     private string _editBuf = "";
     private int _editMode; // 0: none, 1: note, 2: player
     private bool _editJustStarted;
+    private string _chatCommandBuf;
+
+    public TreasureListPanel()
+    {
+        _chatCommandBuf = NormalizeChatCommand(Plugin.Config.TreasureChatCommand);
+    }
 
     public void Draw()
     {
         ImGui.TextUnformatted("藏寶圖清單");
         ImGui.Separator();
+
+        ImGui.AlignTextToFramePadding();
+        ImGui.TextUnformatted("發送頻道指令");
+        ImGui.SameLine();
+        ImGui.SetNextItemWidth(90f);
+        var commandCommitted = ImGui.InputText(
+            "##treasure-chat-command",
+            ref _chatCommandBuf,
+            16,
+            ImGuiInputTextFlags.EnterReturnsTrue);
+        if (commandCommitted || ImGui.IsItemDeactivatedAfterEdit())
+            SaveChatCommand();
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("藏寶圖座標的發送頻道，例如 /p（小隊）或 /cwl1（跨界通訊貝 1）");
+
+        var showOnMappy = Plugin.Config.ShowTreasuresOnMappy;
+        if (ImGui.Checkbox("藏寶圖標到 Mappy 地圖", ref showOnMappy))
+        {
+            Plugin.Config.ShowTreasuresOnMappy = showOnMappy;
+            Plugin.Config.Save();
+            Plugin.MappyMarkers.MarkDirty();
+        }
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("把清單裡尚未完成的藏寶點「全部」畫到 Mappy 的地圖上（不只一個旗標）。\n"
+                             + "需要安裝 Mappy；沒裝時這個選項不會有任何作用，原本的『地圖』按鈕照舊。\n"
+                             + "標記可以在 Mappy 的設定裡以來源「XivTreasureParty」單獨關掉。");
 
         if (!Plugin.PartyService.IsInParty)
         {
@@ -36,6 +68,8 @@ public sealed class TreasureListPanel
             return;
         }
 
+        DrawRouteControls(treasures);
+
         if (ImGui.BeginTable("##treasures", 6,
             ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH | ImGuiTableFlags.ScrollY | ImGuiTableFlags.SizingStretchProp))
         {
@@ -44,7 +78,7 @@ public sealed class TreasureListPanel
             ImGui.TableSetupColumn("地點 / 座標", ImGuiTableColumnFlags.WidthStretch, 2f);
             ImGui.TableSetupColumn("負責玩家", ImGuiTableColumnFlags.WidthStretch, 1.2f);
             ImGui.TableSetupColumn("備註", ImGuiTableColumnFlags.WidthStretch, 1.2f);
-            ImGui.TableSetupColumn("操作", ImGuiTableColumnFlags.WidthFixed, 260f);
+            ImGui.TableSetupColumn("操作", ImGuiTableColumnFlags.WidthFixed, 320f);
             ImGui.TableHeadersRow();
 
             for (var i = 0; i < treasures.Count; i++)
@@ -57,10 +91,14 @@ public sealed class TreasureListPanel
     private void DrawRow(System.Collections.Generic.List<Treasure> list, int index)
     {
         var t = list[index];
+        var navStatus = TreasureNavigator.GetStatus();
         ImGui.TableNextRow();
 
         ImGui.TableNextColumn();
-        ImGui.TextUnformatted(t.Order.ToString());
+        var navigatingHere = navStatus.Busy == true && TreasureNavigator.NavigatingKey == t.FirebaseKey;
+        ImGui.TextUnformatted(navigatingHere ? "→" + t.Order : t.Order.ToString());
+        if (navigatingHere && ImGui.IsItemHovered())
+            ImGui.SetTooltip("Lifestream 正在前往這一筆");
 
         ImGui.TableNextColumn();
         var grade = GradeData.GetByItemId(t.GradeItemId);
@@ -157,12 +195,23 @@ public sealed class TreasureListPanel
             ImGui.SetTooltip("在遊戲內開啟地圖並將旗標設在藏寶點");
         ImGui.SameLine();
 
+        var canNavigate = navStatus.LifestreamAvailable && navStatus.Busy != true && !t.Completed;
+        if (!canNavigate) ImGui.BeginDisabled();
+        if (ImGui.SmallButton("前往##go-" + t.FirebaseKey))
+            TreasureNavigator.TryGoTo(t);
+        if (!canNavigate) ImGui.EndDisabled();
+        if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+            ImGui.SetTooltip(NavigateTooltip(navStatus, t));
+        ImGui.SameLine();
+
         if (ImGui.SmallButton($"發送##send-{t.FirebaseKey}"))
         {
+            // 若玩家剛改完指令就直接按發送，先提交目前輸入值，避免這次仍使用舊頻道。
+            SaveChatCommand();
             SendTreasureToChat(t);
         }
         if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("以 /p 發送『地圖 ( X , Y )』到小隊頻道，含可點擊的地圖連結");
+            ImGui.SetTooltip($"以 {NormalizeChatCommand(Plugin.Config.TreasureChatCommand)} 發送『地圖 ( X , Y )』，含可點擊的地圖連結");
         ImGui.SameLine();
 
         if (ImGui.SmallButton($"刪除##rm-{t.FirebaseKey}"))
@@ -170,7 +219,71 @@ public sealed class TreasureListPanel
     }
 
     /// <summary>
-    /// 對應網頁版 copyPlayerMessage，以 /p 送到小隊頻道。**純文字座標** —
+    /// 清單上方的路線控制列：一鍵前往「依目前排序的下一個未完成藏寶點」。
+    /// </summary>
+    /// <remarks>
+    /// 🔴 順序沿用清單上看到的排序（已完成的排最後，其餘依 <c>order</c>），
+    /// 而 <c>order</c> 正是「優化路線」用 <see cref="Party.RouteOptimizer"/> 寫回去的那一份
+    /// ——所以「下一個」永遠是使用者在畫面上看到的下一列，不會偷偷走另一條路線。
+    /// 🔴 只有按下去才會動，沒有任何自動接手；也不會幫忙開寶箱或打怪。
+    /// </remarks>
+    private static void DrawRouteControls(System.Collections.Generic.List<Treasure> treasures)
+    {
+        var status = TreasureNavigator.GetStatus();
+        var next = treasures.FirstOrDefault(x => !x.Completed);
+
+        var canGo = status.LifestreamAvailable && status.Busy != true && next != null;
+        if (!canGo) ImGui.BeginDisabled();
+        if (ImGui.Button("依路線前往下一個") && next != null)
+            TreasureNavigator.TryGoTo(next);
+        if (!canGo) ImGui.EndDisabled();
+        if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+            ImGui.SetTooltip(NavigateTooltip(status, next));
+        ImGui.SameLine();
+
+        var fly = Plugin.Config.NavigateWithFlight;
+        if (ImGui.Checkbox("允許飛行", ref fly))
+        {
+            Plugin.Config.NavigateWithFlight = fly;
+            Plugin.Config.Save();
+        }
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("最後一段路允許使用飛行坐騎。\n區域不可飛、或還沒解鎖飛行時，Lifestream 會自動改用走的。");
+        ImGui.SameLine();
+
+        // 「不知道」要在列上看得見：問不到 Lifestream 狀態時畫灰字的問號，不要畫成「就緒」。
+        ImGui.AlignTextToFramePadding();
+        if (!status.LifestreamAvailable)
+            ImGui.TextDisabled("需要 Lifestream");
+        else if (status.Busy == true)
+            ImGui.TextDisabled("移動中…");
+        else if (status.Busy == null)
+            ImGui.TextDisabled("狀態 ?");
+        else
+            ImGui.TextDisabled("可出發");
+    }
+
+    /// <summary>「前往」按鈕的 tooltip：能按時說要去哪，不能按時說為什麼。</summary>
+    private static string NavigateTooltip(TreasureNavigator.NavStatus status, Treasure? target)
+    {
+        if (!status.LifestreamAvailable)
+            return "需要 Lifestream\n請先安裝並啟用 Lifestream（實際走路／飛行由 vnavmesh 負責）。";
+        if (target == null)
+            return "清單上沒有未完成的藏寶點";
+        if (target.Completed)
+            return "這一筆已經標記完成了";
+        if (status.Busy == true)
+            return "Lifestream 正在移動中，等它抵達之後再按";
+
+        var line = $"傳送並移動到 {MapData.GetMapName(target.MapId)} ( {target.Coords.X:0.0} , {target.Coords.Y:0.0} )。\n"
+                   + "只把人送過去，不會自動開寶箱、不會自動戰鬥。";
+        if (status.Busy == null)
+            line += "\n（問不到 Lifestream 目前狀態；按下去若被拒絕，稍後再試一次。）";
+        return line;
+    }
+
+    /// <summary>
+    /// 對應網頁版 copyPlayerMessage，以玩家設定的頻道指令發送。**純文字座標** —
     /// 含一個保險的 PreMapLinkPayload 在文字後面（給有裝 AutoConvertMapLink
     /// 等接收端 rewrite 工具的玩家可點），但即使 payload 被 input
     /// sanitizer 剝掉，文字部分的座標一定看得到。
@@ -195,7 +308,8 @@ public sealed class TreasureListPanel
             // 在「chunk 被 input sanitizer 吃掉」的情況下仍能把文字轉成可點連結。
             // 接收端 hook 偵測到 chunk 已存在時會把多餘的純文字模式吃掉避免重複顯示。
             var sb = new Dalamud.Game.Text.SeStringHandling.SeStringBuilder();
-            sb.AddText($"/p {player}{mapName} ( {t.Coords.X:0.0}  , {t.Coords.Y:0.0} )");
+            var chatCommand = NormalizeChatCommand(Plugin.Config.TreasureChatCommand);
+            sb.AddText($"{chatCommand} {player}{mapName} ( {t.Coords.X:0.0}  , {t.Coords.Y:0.0} )");
             if (preLink != null)
                 sb.Add(preLink);
             if (aetheryte != null)
@@ -207,6 +321,32 @@ public sealed class TreasureListPanel
         {
             Plugin.Log.Error(ex, "[SendTreasure] 發送聊天失敗");
         }
+    }
+
+    private void SaveChatCommand()
+    {
+        _chatCommandBuf = NormalizeChatCommand(_chatCommandBuf);
+        if (Plugin.Config.TreasureChatCommand == _chatCommandBuf)
+            return;
+
+        Plugin.Config.TreasureChatCommand = _chatCommandBuf;
+        Plugin.Config.Save();
+    }
+
+    private static string NormalizeChatCommand(string? command)
+    {
+        command = command?.Trim();
+        if (string.IsNullOrEmpty(command))
+            return "/p";
+
+        var firstWhitespace = command.IndexOfAny(new[] { ' ', '\t', '\r', '\n' });
+        if (firstWhitespace >= 0)
+            command = command[..firstWhitespace];
+
+        if (!command.StartsWith("/", StringComparison.Ordinal))
+            command = "/" + command;
+
+        return command.Length > 1 ? command : "/p";
     }
 
     private void CommitPlayer(Treasure t)

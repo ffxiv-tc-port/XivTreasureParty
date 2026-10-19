@@ -98,14 +98,15 @@ public sealed class PartyService
         await _auth.EnsureSignedInAsync().ConfigureAwait(false);
         var uid = _auth.LocalId ?? throw new Exception("使用者未登入");
 
+        // GetAsync 回 null 只發生在 2xx 且內容是 null／空白（節點不存在）；認證失敗、網路錯誤都擲例外。
         var root = await _db.GetAsync<PartyRoot>($"parties/{partyCode}").ConfigureAwait(false);
         if (root == null)
-            throw new Exception("找不到此隊伍，請確認代碼是否正確");
+            throw new PartyGoneException("找不到此隊伍，請確認代碼是否正確");
 
         if (root.Meta?.ExpiresAt is { } exp && DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() > exp)
         {
             try { await _db.RemoveAsync($"parties/{partyCode}").ConfigureAwait(false); } catch { }
-            throw new Exception("此隊伍已過期");
+            throw new PartyGoneException("此隊伍已過期");
         }
 
         var memberCount = root.Members?.Count ?? 0;
@@ -330,11 +331,12 @@ public sealed class PartyService
         return newLocked;
     }
 
-    public Task HeartbeatAsync()
+    /// <summary>ct 取消＝離開隊伍或卸載：連同還在等登入或等回應的那一次一起中止。</summary>
+    public Task HeartbeatAsync(System.Threading.CancellationToken ct = default)
     {
         if (!IsInParty) return Task.CompletedTask;
         return _db.SetAsync($"parties/{CurrentPartyCode}/members/{CurrentUserId}/lastSeen",
-                            ServerTimestamp.Instance);
+                            ServerTimestamp.Instance, ct);
     }
 
     public bool CanModifyOrder() => IsLeader || !OrderLocked;
@@ -374,4 +376,12 @@ public sealed class PartyService
         Plugin.Config.LastPartyCode = null;
         Plugin.Config.Save();
     }
+}
+
+/// <summary>
+/// 伺服器明確回報隊伍不存在或已過期，重試也不會成功；網路、認證、隊伍已滿都不會擲這個。
+/// </summary>
+public sealed class PartyGoneException : Exception
+{
+    public PartyGoneException(string message) : base(message) { }
 }

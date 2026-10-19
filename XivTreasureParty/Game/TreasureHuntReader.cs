@@ -14,13 +14,15 @@ public sealed unsafe class TreasureHuntReader
     private delegate uint GetCurrentTreasureHuntRankDelegate(nint a1);
     private delegate ushort GetCurrentTreasureHuntSpotDelegate(nint a1);
 
-    [Signature("E8 ?? ?? ?? ?? 0F B6 D0 45 0F B6 CE", ScanType = ScanType.Text)]
+    // 三條都明寫 Fallible：遊戲改版後對不上的那一條欄位留 null／0（建構子逐條印 Warning），
+    // IsAvailable 為 false、讀取功能整項停用；不靠「擲例外再接住」。
+    [Signature("E8 ?? ?? ?? ?? 0F B6 D0 45 0F B6 CE", ScanType = ScanType.Text, Fallibility = Fallibility.Fallible)]
     private readonly GetCurrentTreasureHuntRankDelegate? _getRank = null;
 
-    [Signature("E8 ?? ?? ?? ?? 44 0F B7 C0 45 33 C9 0F B7 D3", ScanType = ScanType.Text)]
+    [Signature("E8 ?? ?? ?? ?? 44 0F B7 C0 45 33 C9 0F B7 D3", ScanType = ScanType.Text, Fallibility = Fallibility.Fallible)]
     private readonly GetCurrentTreasureHuntSpotDelegate? _getSpot = null;
 
-    [Signature("48 8D 0D ?? ?? ?? ?? E8 ?? ?? ?? ?? 84 C0 75 E4", Offset = 3, ScanType = ScanType.StaticAddress)]
+    [Signature("48 8D 0D ?? ?? ?? ?? E8 ?? ?? ?? ?? 84 C0 75 E4", Offset = 3, ScanType = ScanType.StaticAddress, Fallibility = Fallibility.Fallible)]
     private readonly nint _treasureHuntManager = nint.Zero;
 
     public bool IsAvailable => _getRank != null && _getSpot != null && _treasureHuntManager != nint.Zero;
@@ -35,18 +37,27 @@ public sealed unsafe class TreasureHuntReader
         {
             Plugin.Log.Warning($"[TreasureHuntReader] signature 解析失敗（遊戲更新後可能需要更新 sig）: {ex.Message}");
         }
+
+        const string lost = "「從遊戲讀取當前藏寶圖」與打開藏寶圖時的自動選取／自動開地圖停用";
+        if (_getRank == null)
+            Plugin.Log.Warning($"[TreasureHuntReader] 特徵碼對不上 GetCurrentTreasureHuntRank（遊戲改版後需要更新）：{lost}");
+        if (_getSpot == null)
+            Plugin.Log.Warning($"[TreasureHuntReader] 特徵碼對不上 GetCurrentTreasureHuntSpot（遊戲改版後需要更新）：{lost}");
+        if (_treasureHuntManager == nint.Zero)
+            Plugin.Log.Warning($"[TreasureHuntReader] 特徵碼對不上 TreasureHuntManager（遊戲改版後需要更新）：{lost}");
     }
 
     /// <summary>
     /// 讀取當前 TreasureHuntRank (對應 TreasureHuntRank sheet RowId)。0 表示沒有解碼的圖。
     /// </summary>
-    public uint GetCurrentRank() => _getRank == null ? 0 : _getRank(_treasureHuntManager);
+    /// <remarks>三條特徵碼缺任何一條都回 0、不呼叫遊戲函式：管理器位址是 0 時呼叫下去是攔不到的存取違規。</remarks>
+    public uint GetCurrentRank() => IsAvailable ? _getRank!(_treasureHuntManager) : 0;
 
     /// <summary>
     /// 讀取當前 TreasureSpot subrow id。
     /// 完整查詢需要 (rank, spot) 兩個 key 進 TreasureSpot sheet。
     /// </summary>
-    public ushort GetCurrentSpot() => _getSpot == null ? (ushort)0 : _getSpot(_treasureHuntManager);
+    public ushort GetCurrentSpot() => IsAvailable ? _getSpot!(_treasureHuntManager) : (ushort)0;
 
     /// <summary>
     /// 一次讀 rank + spot，若無有效值回 null。

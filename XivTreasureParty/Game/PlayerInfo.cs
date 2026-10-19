@@ -11,7 +11,8 @@ public static class PlayerInfo
     {
         try
         {
-            var local = Plugin.ClientState.LocalPlayer;
+            // API13：IClientState.LocalPlayer 已過時，改用 IObjectTable.LocalPlayer（純轉發）。
+            var local = Plugin.ObjectTable.LocalPlayer;
             if (local == null) return null;
             var name = local.Name.TextValue;
             if (string.IsNullOrWhiteSpace(name)) return null;

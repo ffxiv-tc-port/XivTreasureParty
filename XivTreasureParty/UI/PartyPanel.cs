@@ -1,6 +1,7 @@
 using System;
 using System.Linq;
-using ImGuiNET;
+using Dalamud.Bindings.ImGui;
+using XivTreasureParty.Firebase;
 using XivTreasureParty.Game;
 using XivTreasureParty.Party;
 
@@ -13,11 +14,18 @@ public sealed class PartyPanel
     private string _statusMessage = "";
     private DateTime _statusUntil;
     private bool _busy;
+    private bool _statusIsError;
+
+    /// <summary>手動重連按鈕的節流終點，避免連點變成每幀重試。</summary>
+    private DateTime _reconnectCooldownUntil = DateTime.MinValue;
 
     public void Draw()
     {
         var party = Plugin.PartyService;
         var sync = Plugin.SyncService;
+
+        DrawConnectionRow();
+        ImGui.Separator();
 
         if (_nicknameBuf.Length == 0)
         {
@@ -60,22 +68,152 @@ public sealed class PartyPanel
         if (!string.IsNullOrEmpty(_statusMessage) && DateTime.UtcNow < _statusUntil)
         {
             ImGui.Spacing();
-            ImGui.TextColored(new System.Numerics.Vector4(0.4f, 0.9f, 0.4f, 1f), _statusMessage);
+            ImGui.PushTextWrapPos(0f);
+            ImGui.TextColored(_statusIsError ? ErrorColor : new System.Numerics.Vector4(0.4f, 0.9f, 0.4f, 1f), _statusMessage);
+            ImGui.PopTextWrapPos();
         }
+    }
+
+    /// <summary>
+    /// 與網頁版共享房間靠的是三條 Firebase SSE 長連線，斷掉時畫面上必須看得出來。
+    /// 「不知道」也要看得見：從沒收過資料時顯示「?」而不是 0。
+    /// </summary>
+    private void DrawConnectionRow()
+    {
+        var info = Plugin.SyncService.GetConnectionInfo();
+        var inParty = Plugin.PartyService.IsInParty;
+        var (label, color) = DescribeConnection(info, inParty);
+
+        ImGui.TextColored(color, "●");
+        ImGui.SameLine(0, 4f);
+        ImGui.TextColored(color, label);
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip(BuildConnectionTooltip(info, inParty));
+
+        const string btnLabel = "重新連線";
+        var btnWidth = ImGui.CalcTextSize(btnLabel).X + ImGui.GetStyle().FramePadding.X * 2f;
+        ImGui.SameLine();
+        var remain = ImGui.GetContentRegionAvail().X;
+        if (remain > btnWidth)
+            ImGui.SetCursorPosX(ImGui.GetCursorPosX() + remain - btnWidth);
+
+        var cooling = DateTime.UtcNow < _reconnectCooldownUntil;
+        if (cooling) ImGui.BeginDisabled();
+        if (ImGui.SmallButton(btnLabel))
+        {
+            // 自動重連還在退避時按也有效：這是插隊立刻重試一次，不是取消退避策略。
+            _reconnectCooldownUntil = DateTime.UtcNow.AddSeconds(3);
+            if (Plugin.SyncService.ReconnectNow())
+                ShowStatus("已要求重新連線");
+            else
+                ShowStatus("目前不在隊伍中，沒有需要重連的內容");
+        }
+        if (cooling) ImGui.EndDisabled();
+        // 停用中的項目預設不算 hover，要明確允許才看得到 tooltip。
+        if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+            ImGui.SetTooltip(cooling
+                ? "剛剛已經送出重連要求，請稍候再按"
+                : "立刻重試一次同步連線；自動重連還在等待退避時間時按這顆會直接插隊。");
+    }
+
+    private static (string Label, System.Numerics.Vector4 Color) DescribeConnection(SyncConnectionInfo info, bool inParty)
+    {
+        var green = new System.Numerics.Vector4(0.35f, 0.9f, 0.45f, 1f);
+        var yellow = new System.Numerics.Vector4(1f, 0.85f, 0.35f, 1f);
+        var orange = new System.Numerics.Vector4(1f, 0.62f, 0.25f, 1f);
+        var red = new System.Numerics.Vector4(1f, 0.4f, 0.4f, 1f);
+        var grey = new System.Numerics.Vector4(0.6f, 0.6f, 0.6f, 1f);
+
+        switch (info.State)
+        {
+            case StreamConnectionState.Connected:
+                return info.LastEventUtc == null
+                    ? ("已連線（尚未收到資料）", yellow)
+                    : ("已連線", green);
+
+            case StreamConnectionState.Connecting:
+                return (info.Connected > 0 ? $"連線中 {info.Connected}/{info.Total}" : "連線中", yellow);
+
+            case StreamConnectionState.Reconnecting:
+            {
+                var seconds = info.NextRetryUtc is { } next
+                    ? Math.Max(0, (int)Math.Ceiling((next - DateTime.UtcNow).TotalSeconds))
+                    : -1;
+                var when = seconds >= 0 ? $"{seconds} 秒後" : "時間未知";
+                // 失敗次數為 0 ＝ 伺服器把上一條串流正常關掉，只是接回去，不是出錯。
+                return info.FailedAttempts > 0
+                    ? ($"重連中 第 {info.FailedAttempts} 次，{when}", orange)
+                    : ($"重新接上中，{when}", yellow);
+            }
+
+            case StreamConnectionState.Stopped:
+                return ("已斷線，不會自動重連", red);
+
+            default:
+                return (inParty ? "未連線" : "未連線（尚未加入隊伍）", grey);
+        }
+    }
+
+    private static string BuildConnectionTooltip(SyncConnectionInfo info, bool inParty)
+    {
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine("與網頁版共享房間的即時連線（成員／藏寶圖／隊伍設定共三條）。");
+        sb.AppendLine(info.Total == 0
+            ? (inParty ? "目前串流數: 0（訂閱不存在，可按「重新連線」重建）" : "目前串流數: 0（尚未加入隊伍）")
+            : $"已連上 {info.Connected}/{info.Total} 條");
+
+        sb.AppendLine(info.LastEventUtc is { } last
+            ? $"最後收到資料: {Math.Max(0, (int)(DateTime.UtcNow - last).TotalSeconds)} 秒前"
+            : "最後收到資料: ?（這次連線還沒收到過任何資料）");
+
+        if (info.FailedAttempts > 0)
+            sb.AppendLine($"連續失敗次數: {info.FailedAttempts}");
+
+        sb.AppendLine(string.IsNullOrWhiteSpace(info.LastError)
+            ? "最後錯誤: 無"
+            : $"最後錯誤: {info.LastError}");
+
+        sb.Append("斷線時會自動以 1 秒起跳、上限 30 秒的間隔重連；按「重新連線」可以不等直接重試。");
+        return sb.ToString();
     }
 
     private void DrawNotInParty()
     {
         ImGui.TextUnformatted("尚未加入任何隊伍");
+        ImGui.PushTextWrapPos(0f);
+        ImGui.TextDisabled("建立或加入隊伍時才會連線到同步伺服器（Firebase）；離開隊伍後就不再連線。");
+        ImGui.PopTextWrapPos();
+
+        if (!_joinCodePrefilled)
+        {
+            _joinCodePrefilled = true;
+            if (_joinCodeBuf.Length == 0 && !string.IsNullOrWhiteSpace(Plugin.Config.LastPartyCode))
+                _joinCodeBuf = Plugin.Config.LastPartyCode!;
+        }
+
+        var rejoinError = Plugin.AutoRejoinError;
+        if (rejoinError != null)
+        {
+            ImGui.PushTextWrapPos(0f);
+            ImGui.TextColored(ErrorColor, rejoinError);
+            ImGui.PopTextWrapPos();
+        }
+
+        var autoRejoining = Plugin.AutoRejoinInProgress;
+        if (autoRejoining)
+            ImGui.TextColored(new System.Numerics.Vector4(1f, 0.85f, 0.35f, 1f), "正在自動重新加入上次的隊伍…");
         ImGui.Spacing();
+
+        // 推彈條件用區域變數：AutoRejoinInProgress 由背景執行緒改，同一幀內可能翻轉。
+        var blockActions = autoRejoining;
+        if (blockActions) ImGui.BeginDisabled();
 
         if (ImGui.Button("建立新隊伍", new System.Numerics.Vector2(-1, 28)) && !_busy)
         {
             RunAsync(async () =>
             {
                 await Plugin.PartyService.CreatePartyAsync(string.IsNullOrWhiteSpace(_nicknameBuf) ? null : _nicknameBuf);
-                Plugin.SyncService.Start(Plugin.PartyService.CurrentPartyCode!);
-                Plugin.Heartbeat.Start();
+                StartSessionAfterJoin();
             }, "已建立隊伍");
         }
 
@@ -91,10 +229,36 @@ public sealed class PartyPanel
             {
                 await Plugin.PartyService.JoinPartyAsync(code,
                     string.IsNullOrWhiteSpace(_nicknameBuf) ? null : _nicknameBuf);
-                Plugin.SyncService.Start(Plugin.PartyService.CurrentPartyCode!);
-                Plugin.Heartbeat.Start();
+                StartSessionAfterJoin();
             }, "已加入隊伍");
         }
+
+        if (blockActions) ImGui.EndDisabled();
+
+        ImGui.Spacing();
+        var autoRejoin = Plugin.Config.AutoRejoinOnStart;
+        if (ImGui.Checkbox("啟動時自動重新加入上次的隊伍", ref autoRejoin))
+        {
+            Plugin.Config.AutoRejoinOnStart = autoRejoin;
+            Plugin.Config.Save();
+        }
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("開啟後，插件載入時若記得上次的隊伍代碼，會自動連線到同步伺服器並重新加入。\n"
+                             + "關閉時（預設）載入插件不會連線，只有按「建立新隊伍」或「加入」才會連線。\n"
+                             + "改這個選項不會立刻連線，下次載入插件才生效。");
+    }
+
+    private static readonly System.Numerics.Vector4 ErrorColor = new(1f, 0.4f, 0.4f, 1f);
+
+    private bool _joinCodePrefilled;
+
+    /// <summary>建立／加入成功後開串流與心跳；等回應期間插件已卸載就不開。</summary>
+    private static void StartSessionAfterJoin()
+    {
+        if (Plugin.IsUnloading) return;
+        Plugin.AutoRejoinError = null;
+        Plugin.SyncService.Start(Plugin.PartyService.CurrentPartyCode!);
+        Plugin.Heartbeat.Start();
     }
 
     private void DrawInParty()
@@ -155,7 +319,7 @@ public sealed class PartyPanel
             RunOptimize();
         }
         if (!canOptimize) ImGui.EndDisabled();
-        if (ImGui.IsItemHovered())
+        if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
         {
             if (party.OrderLocked && !party.IsLeader)
                 ImGui.SetTooltip("順序已被房主鎖定");
@@ -216,7 +380,7 @@ public sealed class PartyPanel
             catch (Exception ex)
             {
                 Plugin.Log.Error(ex, "優化路線失敗");
-                ShowStatus("優化失敗: " + ex.Message);
+                ShowStatus("優化失敗: " + ex.Message, isError: true);
             }
             finally
             {
@@ -240,7 +404,7 @@ public sealed class PartyPanel
             catch (Exception ex)
             {
                 Plugin.Log.Error(ex, "PartyPanel 操作失敗");
-                ShowStatus("失敗: " + ex.Message);
+                ShowStatus("失敗: " + ex.Message, isError: true);
             }
             finally
             {
@@ -249,9 +413,11 @@ public sealed class PartyPanel
         });
     }
 
-    private void ShowStatus(string msg)
+    private void ShowStatus(string msg, bool isError = false)
     {
+        _statusIsError = isError;
         _statusMessage = msg;
-        _statusUntil = DateTime.UtcNow.AddSeconds(4);
+        // 失敗訊息（例如連不上同步伺服器）停留久一點，免得沒看到就消失。
+        _statusUntil = DateTime.UtcNow.AddSeconds(isError ? 15 : 4);
     }
 }

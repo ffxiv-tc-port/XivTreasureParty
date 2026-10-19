@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Text.Json;
+using System.Threading;
 using XivTreasureParty.Firebase;
 using XivTreasureParty.Party.Models;
 
@@ -10,18 +11,35 @@ namespace XivTreasureParty.Party;
 /// 對應網頁版 sync-service.js — 透過 Firebase SSE 同時監聽 members / treasures / meta。
 /// 收到事件後解析 path 區分增刪改，更新本地 snapshot，最後觸發 UI 回調。
 /// </summary>
+/// <remarks>
+/// 執行緒契約：<see cref="Members"/>／<see cref="Treasures"/> 是「發佈後結構不再改」的快照，
+/// 任何執行緒都可以無鎖直接讀；寫入端一律在 <c>_writeLock</c> 內複製副本、改完再整體換引用。
+/// </remarks>
 public sealed class SyncService
 {
     private readonly FirebaseStreamClient _stream;
 
-    private IDisposable? _membersSub;
-    private IDisposable? _treasuresSub;
-    private IDisposable? _metaSub;
+    private FirebaseStreamClient.StreamSubscription? _membersSub;
+    private FirebaseStreamClient.StreamSubscription? _treasuresSub;
+    private FirebaseStreamClient.StreamSubscription? _metaSub;
 
     private string? _currentCode;
 
-    public Dictionary<string, PartyMember> Members { get; } = new();
-    public Dictionary<string, Treasure> Treasures { get; } = new();
+    private DateTime _lastManualReconnectUtc = DateTime.MinValue;
+
+    // 寫入端：SSE 事件（轉派到 framework 執行緒）、Stop()／Start()（執行緒池）、樂觀本地增刪。
+    // 讀取端：每幀的繪製執行緒與 Framework.Update，外加執行緒池上的樂觀路線更新。
+    // 讀取端不進這把鎖，所以繪製永遠不會被同步工作阻塞。
+    private readonly object _writeLock = new();
+    private Dictionary<string, PartyMember> _members = new();
+    private Dictionary<string, Treasure> _treasures = new();
+
+    /// <summary>已發佈的成員快照；字典結構發佈後不再改（元素物件的欄位仍會就地更新）。</summary>
+    public IReadOnlyDictionary<string, PartyMember> Members => Volatile.Read(ref _members);
+
+    /// <summary>已發佈的藏寶圖快照；同 <see cref="Members"/> 的契約。</summary>
+    public IReadOnlyDictionary<string, Treasure> Treasures => Volatile.Read(ref _treasures);
+
     public PartyMeta? Meta { get; private set; }
 
     public event Action? MembersChanged;
@@ -41,12 +59,12 @@ public sealed class SyncService
 
         _membersSub = _stream.Subscribe(
             $"parties/{partyCode}/members",
-            ev => RunSafeOnFrameworkThread(() => ApplyPut(Members, ev, ApplyMemberValue), "members"),
+            ev => RunSafeOnFrameworkThread(() => ApplyMembers(ev), "members"),
             ex => SyncError?.Invoke(ex));
 
         _treasuresSub = _stream.Subscribe(
             $"parties/{partyCode}/treasures",
-            ev => RunSafeOnFrameworkThread(() => ApplyPut(Treasures, ev, ApplyTreasureValue), "treasures"),
+            ev => RunSafeOnFrameworkThread(() => ApplyTreasures(ev), "treasures"),
             ex => SyncError?.Invoke(ex));
 
         _metaSub = _stream.Subscribe(
@@ -57,6 +75,10 @@ public sealed class SyncService
 
     private static void RunSafeOnFrameworkThread(Action action, string scope)
     {
+        // 卸載窗內轉派會就地在 SSE 的執行緒上跑，那時改 snapshot 或觸發 UI 回調都不安全。
+        if (FrameworkUnloadGuard.ShouldSkip(scope))
+            return;
+
         // 包一層 try/catch + 觀察 Task exception，避免 unobserved exception 終結整個 SSE callback。
         Plugin.Framework.RunOnFrameworkThread(() =>
         {
@@ -72,15 +94,111 @@ public sealed class SyncService
         }, System.Threading.Tasks.TaskContinuationOptions.OnlyOnFaulted);
     }
 
+    /// <summary>離開／切換隊伍。呼叫端多半在執行緒池上（UI 按鈕都包在 Task.Run 裡）。</summary>
     public void Stop()
     {
         _membersSub?.Dispose(); _membersSub = null;
         _treasuresSub?.Dispose(); _treasuresSub = null;
         _metaSub?.Dispose(); _metaSub = null;
-        Members.Clear();
-        Treasures.Clear();
+
+        lock (_writeLock)
+        {
+            Volatile.Write(ref _members, new Dictionary<string, PartyMember>());
+            Volatile.Write(ref _treasures, new Dictionary<string, Treasure>());
+        }
+
         Meta = null;
         _currentCode = null;
+    }
+
+    /// <summary>目前訂閱中的隊伍代碼（沒訂閱時為 null）。</summary>
+    public string? CurrentCode => _currentCode;
+
+    /// <summary>
+    /// 把三條串流的狀態聚合成一列給 UI 用。在繪製執行緒呼叫；
+    /// 每條串流的狀態都是背景執行緒整體指派的不可變快照，讀到的一定是完整的一份。
+    /// </summary>
+    public SyncConnectionInfo GetConnectionInfo()
+    {
+        var subs = new[] { _membersSub, _treasuresSub, _metaSub };
+        var info = new SyncConnectionInfo { Total = 0, Connected = 0, State = StreamConnectionState.Idle };
+
+        var anyStopped = false;
+        var anyReconnecting = false;
+        var anyConnecting = false;
+
+        foreach (var sub in subs)
+        {
+            if (sub == null) continue;
+            var st = sub.Status;
+            info.Total++;
+
+            switch (st.State)
+            {
+                case StreamConnectionState.Connected: info.Connected++; break;
+                case StreamConnectionState.Reconnecting: anyReconnecting = true; break;
+                case StreamConnectionState.Connecting: anyConnecting = true; break;
+                case StreamConnectionState.Stopped: anyStopped = true; break;
+            }
+
+            if (st.FailedAttempts > info.FailedAttempts) info.FailedAttempts = st.FailedAttempts;
+
+            if (st.NextRetryUtc is { } next && (info.NextRetryUtc == null || next < info.NextRetryUtc))
+                info.NextRetryUtc = next;
+
+            if (st.LastEventUtc is { } le && (info.LastEventUtc == null || le > info.LastEventUtc))
+                info.LastEventUtc = le;
+
+            if (info.LastError == null && st.State != StreamConnectionState.Connected)
+                info.LastError = st.LastError;
+        }
+
+        if (info.Total == 0)
+            info.State = StreamConnectionState.Idle;
+        else if (anyStopped)
+            info.State = StreamConnectionState.Stopped;
+        else if (anyReconnecting)
+            info.State = StreamConnectionState.Reconnecting;
+        else if (info.Connected == info.Total)
+            info.State = StreamConnectionState.Connected;
+        else if (anyConnecting)
+            info.State = StreamConnectionState.Connecting;
+        else
+            info.State = StreamConnectionState.Idle;
+
+        return info;
+    }
+
+    /// <summary>
+    /// 手動重新連線：三條串流各插隊一次立刻重試（不等退避）。
+    /// 訂閱整個不見時（例如重連迴圈曾經停掉、或啟動時沒接上）則重新建立訂閱。
+    /// 自帶 3 秒節流，避免使用者連點變成每幀重試。
+    /// </summary>
+    public bool ReconnectNow()
+    {
+        var now = DateTime.UtcNow;
+        if (now - _lastManualReconnectUtc < TimeSpan.FromSeconds(3)) return false;
+        _lastManualReconnectUtc = now;
+
+        var code = _currentCode ?? Plugin.PartyService.CurrentPartyCode;
+        if (string.IsNullOrWhiteSpace(code))
+        {
+            Plugin.Log.Information("[Sync] 手動重新連線：目前不在任何隊伍中，沒有東西可以連。");
+            return false;
+        }
+
+        if (_membersSub == null || _treasuresSub == null || _metaSub == null)
+        {
+            Plugin.Log.Information($"[Sync] 手動重新連線：訂閱不存在，重新建立三條串流（隊伍 {code}）。");
+            Start(code!);
+            return true;
+        }
+
+        Plugin.Log.Information($"[Sync] 手動重新連線：要求三條串流立刻重試（隊伍 {code}）。");
+        _membersSub.RequestImmediateRetry();
+        _treasuresSub.RequestImmediateRetry();
+        _metaSub.RequestImmediateRetry();
+        return true;
     }
 
     /// <summary>
@@ -90,10 +208,20 @@ public sealed class SyncService
     /// </summary>
     public void UpsertTreasureLocal(string key, Treasure t)
     {
+        // 呼叫端在 await 之後的執行緒池上。
+        if (FrameworkUnloadGuard.ShouldSkip("本地新增藏寶圖"))
+            return;
+
         Plugin.Framework.RunOnFrameworkThread(() =>
         {
             t.FirebaseKey = key;
-            Treasures[key] = t;
+            lock (_writeLock)
+            {
+                var next = new Dictionary<string, Treasure>(_treasures) { [key] = t };
+                Volatile.Write(ref _treasures, next);
+            }
+
+            // 事件放在鎖外：訂閱端會碰 UI 狀態。
             TreasuresChanged?.Invoke();
         });
     }
@@ -101,9 +229,20 @@ public sealed class SyncService
     /// <summary>同上，刪除時也補一個本地刪除（remove 在 SSE 醒來前不會出現）。</summary>
     public void RemoveTreasureLocal(string key)
     {
+        if (FrameworkUnloadGuard.ShouldSkip("本地刪除藏寶圖"))
+            return;
+
         Plugin.Framework.RunOnFrameworkThread(() =>
         {
-            if (Treasures.Remove(key))
+            bool removed;
+            lock (_writeLock)
+            {
+                var next = new Dictionary<string, Treasure>(_treasures);
+                removed = next.Remove(key);
+                if (removed) Volatile.Write(ref _treasures, next);
+            }
+
+            if (removed)
                 TreasuresChanged?.Invoke();
         });
     }
@@ -111,11 +250,40 @@ public sealed class SyncService
     /// <summary>給 PartyService 在批次本機更新 order 後通知 UI 重畫。</summary>
     public void NotifyTreasuresChanged()
     {
+        if (FrameworkUnloadGuard.ShouldSkip("藏寶圖清單通知"))
+            return;
+
         Plugin.Framework.RunOnFrameworkThread(() => TreasuresChanged?.Invoke());
     }
 
-    private void ApplyPut<T>(Dictionary<string, T> target, StreamEvent ev,
-                             Action<Dictionary<string, T>, string, JsonElement> applyValue) where T : class
+    /// <summary>成員事件：複製一份→改副本→整體發佈。只在 framework 執行緒上執行。</summary>
+    private void ApplyMembers(StreamEvent ev)
+    {
+        lock (_writeLock)
+        {
+            var next = new Dictionary<string, PartyMember>(_members);
+            ApplyPut(next, ev, ApplyMemberValue);
+            Volatile.Write(ref _members, next);
+        }
+
+        MembersChanged?.Invoke();
+    }
+
+    /// <summary>藏寶圖事件：同 <see cref="ApplyMembers"/>。解析失敗時整份副本丟掉，不會留半套。</summary>
+    private void ApplyTreasures(StreamEvent ev)
+    {
+        lock (_writeLock)
+        {
+            var next = new Dictionary<string, Treasure>(_treasures);
+            ApplyPut(next, ev, ApplyTreasureValue);
+            Volatile.Write(ref _treasures, next);
+        }
+
+        TreasuresChanged?.Invoke();
+    }
+
+    private static void ApplyPut<T>(Dictionary<string, T> target, StreamEvent ev,
+                                    Action<Dictionary<string, T>, string, JsonElement> applyValue) where T : class
     {
         var path = ev.Path;
         using var doc = JsonDocument.Parse(ev.DataJson);
@@ -170,9 +338,6 @@ public sealed class SyncService
                 ApplyFieldPatch(target, id, fieldPath, root);
             }
         }
-
-        if (typeof(T) == typeof(PartyMember)) MembersChanged?.Invoke();
-        else if (typeof(T) == typeof(Treasure)) TreasuresChanged?.Invoke();
     }
 
     /// <summary>
@@ -308,4 +473,27 @@ public sealed class SyncService
         Plugin.PartyService.SetOrderLocked(Meta?.OrderLocked ?? false);
         MetaChanged?.Invoke();
     }
+}
+
+/// <summary>三條串流聚合後的連線狀態，只給 UI 顯示用。</summary>
+public sealed class SyncConnectionInfo
+{
+    public StreamConnectionState State { get; set; } = StreamConnectionState.Idle;
+
+    /// <summary>三條串流裡最高的連續失敗次數。</summary>
+    public int FailedAttempts { get; set; }
+
+    /// <summary>最快的一條下次重試的時刻。</summary>
+    public DateTime? NextRetryUtc { get; set; }
+
+    /// <summary>最後一次收到資料的時刻。null＝從來沒收過（畫面上要顯示成「?」而不是 0）。</summary>
+    public DateTime? LastEventUtc { get; set; }
+
+    public string? LastError { get; set; }
+
+    /// <summary>目前有幾條串流。</summary>
+    public int Total { get; set; }
+
+    /// <summary>其中連上的有幾條。</summary>
+    public int Connected { get; set; }
 }

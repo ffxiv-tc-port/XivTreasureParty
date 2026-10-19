@@ -8,6 +8,7 @@ using Dalamud.Game.Text.SeStringHandling.Payloads;
 using Dalamud.Hooking;
 using Dalamud.Plugin.Services;
 using Dalamud.Utility.Signatures;
+using FFXIVClientStructs.FFXIV.Client.System.String;
 
 namespace XivTreasureParty.Game;
 
@@ -25,10 +26,11 @@ namespace XivTreasureParty.Game;
 /// </summary>
 public sealed unsafe class MapLinkAutoConverter : IDisposable
 {
-    private delegate nint MessageParseDelegate(nint a, nint b);
+    // c：呼叫端傳 0/1；原生函式把它整個 qword 往下轉交，所以維持指標寬度。
+    private delegate nint MessageParseDelegate(nint a, nint b, nint c);
 
     [Signature("E8 ?? ?? ?? ?? 48 8B D0 48 8D 4D D0 E8 ?? ?? ?? ?? 49 8B 07",
-               DetourName = nameof(ParseMessageDetour))]
+               DetourName = nameof(ParseMessageDetour), Fallibility = Fallibility.Fallible)]
     private readonly Hook<MessageParseDelegate>? _hook = null;
 
     // 規格：必須有  (FFXIV 內建的旗標 PUA 字符) 開頭，
@@ -86,14 +88,15 @@ public sealed unsafe class MapLinkAutoConverter : IDisposable
         try { _hook?.Dispose(); } catch { }
     }
 
-    private nint ParseMessageDetour(nint a, nint b)
+    private nint ParseMessageDetour(nint a, nint b, nint c)
     {
-        var ret = _hook!.Original(a, b);
+        var ret = _hook!.OriginalDisposeSafe(a, b, c);
         if (!Plugin.Config.EnableMapLinkConversion) return ret;
 
         try
         {
-            var pMessage = Marshal.ReadIntPtr(ret);
+            var str = (Utf8String*)ret;
+            var pMessage = (nint)str->StringPtr.Value;
             if (pMessage == IntPtr.Zero) return ret;
 
             // 計算 null-terminated 長度
@@ -135,13 +138,9 @@ public sealed unsafe class MapLinkAutoConverter : IDisposable
                 if (dedupChanged)
                 {
                     var newMessage = parsed.Encode();
-                    var capacity = Marshal.ReadInt64(ret + 8);
+                    var capacity = str->BufSize;
                     if (newMessage.Length + 1 <= capacity)
-                    {
-                        Marshal.WriteInt64(ret + 16, newMessage.Length + 1);
-                        Marshal.Copy(newMessage, 0, pMessage, newMessage.Length);
-                        Marshal.WriteByte(pMessage, newMessage.Length, 0x00);
-                    }
+                        WriteBackInPlace(str, pMessage, newMessage);
                 }
                 return ret;
             }
@@ -185,15 +184,13 @@ public sealed unsafe class MapLinkAutoConverter : IDisposable
                 parsed.Payloads.InsertRange(i, newPayloads);
 
                 var newMessage = parsed.Encode();
-                var capacity = Marshal.ReadInt64(ret + 8);
+                var capacity = str->BufSize;
                 if (newMessage.Length + 1 > capacity)
                 {
                     Plugin.Log.Debug($"[MapLinkAutoConverter] 訊息容量 {capacity} 不足以容納 {newMessage.Length + 1} bytes");
                     return ret;
                 }
-                Marshal.WriteInt64(ret + 16, newMessage.Length + 1);
-                Marshal.Copy(newMessage, 0, pMessage, newMessage.Length);
-                Marshal.WriteByte(pMessage, newMessage.Length, 0x00);
+                WriteBackInPlace(str, pMessage, newMessage);
                 break;
             }
         }
@@ -203,5 +200,16 @@ public sealed unsafe class MapLinkAutoConverter : IDisposable
         }
 
         return ret;
+    }
+
+    // 呼叫端已確認 newMessage.Length + 1 <= BufSize；就地寫入、不重配置緩衝區。
+    // 欄位照原生 SetString：0x18 是 UTF-8 字元數快取、0x20（CS 名 IsEmpty）是「快取有效」旗標，
+    // SetString 只清旗標讓下次取字元數重算，不直接寫 0x18。
+    private static void WriteBackInPlace(Utf8String* str, nint pMessage, byte[] newMessage)
+    {
+        Marshal.Copy(newMessage, 0, pMessage, newMessage.Length);
+        Marshal.WriteByte(pMessage, newMessage.Length, 0x00);
+        str->BufUsed = newMessage.Length + 1;
+        str->IsEmpty = false;
     }
 }

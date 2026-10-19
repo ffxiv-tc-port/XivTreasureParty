@@ -44,7 +44,11 @@ public sealed class HeartbeatService
             try
             {
                 if (_party.IsInParty)
-                    await _party.HeartbeatAsync().ConfigureAwait(false);
+                    await _party.HeartbeatAsync(ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                return;
             }
             catch (Exception ex)
             {

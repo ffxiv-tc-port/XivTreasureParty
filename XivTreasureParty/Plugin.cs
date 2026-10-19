@@ -18,6 +18,10 @@ public sealed class Plugin : IDalamudPlugin
     public static IDalamudPluginInterface PluginInterface { get; private set; } = null!;
     public static ICommandManager CommandManager { get; private set; } = null!;
     public static IClientState ClientState { get; private set; } = null!;
+
+    // API13 把 IClientState.LocalPlayer 標為過時，替代品是 IObjectTable.LocalPlayer。
+    // Dalamud 端 ClientState.LocalPlayer 本身就是 => this.objectTable.LocalPlayer 的純轉發。
+    public static IObjectTable ObjectTable { get; private set; } = null!;
     public static IDataManager DataManager { get; private set; } = null!;
     public static IPluginLog Log { get; private set; } = null!;
     public static IChatGui ChatGui { get; private set; } = null!;
@@ -38,6 +42,7 @@ public sealed class Plugin : IDalamudPlugin
     public static TreasureHuntReader HuntReader { get; private set; } = null!;
     public static HuntAutoCapture HuntAutoCapture { get; private set; } = null!;
     public static MapLinkAutoConverter MapLinkAutoConverter { get; private set; } = null!;
+    public static MappyMarkerBridge MappyMarkers { get; private set; } = null!;
 
     public static PluginWindow Window { get; private set; } = null!;
 
@@ -50,11 +55,13 @@ public sealed class Plugin : IDalamudPlugin
         IChatGui chatGui,
         IFramework framework,
         IGameInteropProvider gameInterop,
-        IGameGui gameGui)
+        IGameGui gameGui,
+        IObjectTable objectTable)
     {
         PluginInterface = pluginInterface;
         CommandManager = commandManager;
         ClientState = clientState;
+        ObjectTable = objectTable;
         DataManager = dataManager;
         Log = pluginLog;
         ChatGui = chatGui;
@@ -74,6 +81,7 @@ public sealed class Plugin : IDalamudPlugin
         HuntReader = new TreasureHuntReader(gameInterop);
         HuntAutoCapture = new HuntAutoCapture(framework);
         MapLinkAutoConverter = new MapLinkAutoConverter(gameInterop);
+        MappyMarkers = new MappyMarkerBridge(framework, SyncService);
 
         Window = new PluginWindow();
         PluginInterface.UiBuilder.Draw += Window.Draw;
@@ -85,32 +93,71 @@ public sealed class Plugin : IDalamudPlugin
             HelpMessage = "開啟 XIV 藏寶圖工具小幫手主視窗"
         });
 
-        _ = InitAsync();
+        // 載入時不碰網路：登入延到建立／加入隊伍那一刻（FirebaseDatabaseClient 每次請求前自己確保登入）。
+        if (Config.AutoRejoinOnStart && !string.IsNullOrWhiteSpace(Config.LastPartyCode))
+        {
+            AutoRejoinInProgress = true;
+            _ = System.Threading.Tasks.Task.Run(AutoRejoinAsync);
+        }
     }
 
-    private async System.Threading.Tasks.Task InitAsync()
+    /// <summary>啟動時自動重新加入進行中；UI 用它擋住同時手動建立／加入。</summary>
+    public static volatile bool AutoRejoinInProgress;
+
+    /// <summary>最近一次啟動時自動重新加入失敗的原因（給隊伍面板顯示）；成功、或之後手動建立／加入成功時清成 null。</summary>
+    public static volatile string? AutoRejoinError;
+
+    private static volatile bool _unloading;
+
+    /// <summary>Dispose 已開始；背景工作等完網路後先看它，再決定要不要開串流與心跳。</summary>
+    public static bool IsUnloading => _unloading;
+
+    private static async System.Threading.Tasks.Task AutoRejoinAsync()
     {
         try
         {
-            await FirebaseAuth.EnsureSignedInAsync().ConfigureAwait(false);
-
-            if (Config.AutoRejoinOnStart && !string.IsNullOrWhiteSpace(Config.LastPartyCode))
+            var lastCode = Config.LastPartyCode;
+            if (!string.IsNullOrWhiteSpace(lastCode))
             {
                 try
                 {
-                    await PartyService.TryRejoinAsync(Config.LastPartyCode!, Config.Nickname).ConfigureAwait(false);
+                    await PartyService.TryRejoinAsync(lastCode, Config.Nickname).ConfigureAwait(false);
+                    // 等回應期間插件已卸載：不再開串流與心跳，否則重連迴圈會在卸載後繼續跑。
+                    if (_unloading) return;
                     SyncService.Start(PartyService.CurrentPartyCode!);
                     Heartbeat.Start();
+                    AutoRejoinError = null;
+                    Log.Information($"啟動時自動重新加入隊伍 {lastCode} 成功");
+                }
+                catch (PartyGoneException ex)
+                {
+                    AutoRejoinError = $"自動重新加入隊伍 {lastCode} 失敗：{ex.Message}";
+                    // 只在設定檔仍記著這一隊時才清：等待回應期間使用者手動加入的新隊伍不能被一起忘掉。
+                    if (Config.LastPartyCode == lastCode)
+                    {
+                        Config.LastPartyCode = null;
+                        Config.Save();
+                        Log.Info($"自動重新加入隊伍 {lastCode} 失敗：{ex.Message}；已清除記住的隊伍代碼，之後啟動不再重試");
+                    }
+                    else
+                    {
+                        Log.Info($"自動重新加入隊伍 {lastCode} 失敗：{ex.Message}");
+                    }
                 }
                 catch (Exception ex)
                 {
+                    AutoRejoinError = $"自動重新加入隊伍 {lastCode} 失敗：{ex.Message}";
                     Log.Warning($"自動重新加入隊伍失敗：{ex.Message}");
                 }
             }
         }
         catch (Exception ex)
         {
-            Log.Error(ex, "初始化 Firebase 失敗");
+            Log.Error(ex, "啟動時自動重新加入隊伍失敗");
+        }
+        finally
+        {
+            AutoRejoinInProgress = false;
         }
     }
 
@@ -121,6 +168,8 @@ public sealed class Plugin : IDalamudPlugin
 
     public void Dispose()
     {
+        _unloading = true;
+        try { MappyMarkers.Dispose(); } catch { }
         try { MapLinkAutoConverter.Dispose(); } catch { }
         try { HuntAutoCapture.Dispose(); } catch { }
         try { Heartbeat.Stop(); } catch { }

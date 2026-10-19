@@ -36,12 +36,27 @@ public sealed class FirebaseAuthClient : IDisposable
         }
     }
 
+    /// <summary>
+    /// 把快取的憑證標記為過期，讓下一次 EnsureSignedInAsync 一定重新取得。
+    /// 伺服器回報 auth_revoked 時必須呼叫：本地記的到期時間只是「上次刷新時間 + 55 分」的估算，
+    /// 伺服器已經不認這顆時，沿用同一顆重連只會無限重試同一個失敗。
+    /// </summary>
+    public void InvalidateToken()
+    {
+        // 只是一個 DateTime 欄位的整體指派，讀寫兩端都不會看到寫到一半的值。
+        TokenExpiresAtUtc = DateTime.MinValue;
+    }
+
     public async Task<string> EnsureSignedInAsync(CancellationToken ct = default)
     {
         await _mutex.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            if (IsSignedIn && DateTime.UtcNow < TokenExpiresAtUtc - TimeSpan.FromMinutes(2))
+            // 刻意不寫成 TokenExpiresAtUtc - TimeSpan.FromMinutes(2)：InvalidateToken() 會把 TokenExpiresAtUtc 設成 DateTime.MinValue，
+            // 建構子在設定檔沒有 LastTokenRefreshedAtUtc 時也會給 MinValue；對 MinValue 做減法會擲 ArgumentOutOfRangeException。
+            // 這是認證的第一道判斷，炸在這裡等於建立隊伍／加入隊伍／心跳／串流重連全部失效。
+            // 加法形式語意等價（a < b - c ⟺ b > a + c），而 UtcNow + 2 分鐘不可能溢位。
+            if (IsSignedIn && TokenExpiresAtUtc > DateTime.UtcNow + TimeSpan.FromMinutes(2))
                 return IdToken!;
 
             if (!string.IsNullOrEmpty(RefreshToken))
