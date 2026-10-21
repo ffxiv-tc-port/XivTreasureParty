@@ -24,11 +24,15 @@ public sealed class HeartbeatService
         _auth = auth;
     }
 
-    public void Start()
+    /// <summary>重開心跳迴圈；插件已開始卸載時不開並回 false。</summary>
+    public bool Start() => Plugin.RunIfNotUnloading(StartCore);
+
+    private void StartCore()
     {
         Stop();
-        _cts = new CancellationTokenSource();
-        _loop = Task.Run(() => LoopAsync(_cts.Token));
+        var cts = new CancellationTokenSource();
+        _cts = cts;
+        _loop = Task.Run(() => LoopAsync(cts.Token));
     }
 
     public void Stop()

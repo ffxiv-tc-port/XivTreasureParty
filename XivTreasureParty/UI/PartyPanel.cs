@@ -255,10 +255,8 @@ public sealed class PartyPanel
     /// <summary>建立／加入成功後開串流與心跳；等回應期間插件已卸載就不開。</summary>
     private static void StartSessionAfterJoin()
     {
-        if (Plugin.IsUnloading) return;
+        if (!Plugin.TryStartSession(Plugin.PartyService.CurrentPartyCode!)) return;
         Plugin.AutoRejoinError = null;
-        Plugin.SyncService.Start(Plugin.PartyService.CurrentPartyCode!);
-        Plugin.Heartbeat.Start();
     }
 
     private void DrawInParty()

@@ -109,8 +109,31 @@ public sealed class Plugin : IDalamudPlugin
 
     private static volatile bool _unloading;
 
+    // 契約：Dispose 只在這把鎖內把 _unloading 設成 true；串流與心跳的 Start 都在鎖內判旗標後才開，
+    // 所以 Dispose 拿到鎖之後不會再有新的 Start。鎖內只建立工作與取消，不做 I/O、不等網路。
+    private static readonly object StartGate = new();
+
     /// <summary>Dispose 已開始；背景工作等完網路後先看它，再決定要不要開串流與心跳。</summary>
     public static bool IsUnloading => _unloading;
+
+    /// <summary>插件沒在卸載時才執行 <paramref name="start"/>（在 <c>StartGate</c> 內）；卸載中回 false、什麼都不做。</summary>
+    internal static bool RunIfNotUnloading(Action start)
+    {
+        lock (StartGate)
+        {
+            if (_unloading) return false;
+            start();
+            return true;
+        }
+    }
+
+    /// <summary>開串流與心跳，兩者同在一次閘門內（要嘛都開、要嘛都不開）；卸載中回 false。</summary>
+    internal static bool TryStartSession(string partyCode) =>
+        RunIfNotUnloading(() =>
+        {
+            SyncService.Start(partyCode);
+            Heartbeat.Start();
+        });
 
     private static async System.Threading.Tasks.Task AutoRejoinAsync()
     {
@@ -123,9 +146,7 @@ public sealed class Plugin : IDalamudPlugin
                 {
                     await PartyService.TryRejoinAsync(lastCode, Config.Nickname).ConfigureAwait(false);
                     // 等回應期間插件已卸載：不再開串流與心跳，否則重連迴圈會在卸載後繼續跑。
-                    if (_unloading) return;
-                    SyncService.Start(PartyService.CurrentPartyCode!);
-                    Heartbeat.Start();
+                    if (!TryStartSession(PartyService.CurrentPartyCode!)) return;
                     AutoRejoinError = null;
                     Log.Information($"啟動時自動重新加入隊伍 {lastCode} 成功");
                 }
@@ -168,7 +189,7 @@ public sealed class Plugin : IDalamudPlugin
 
     public void Dispose()
     {
-        _unloading = true;
+        lock (StartGate) _unloading = true;
         try { MappyMarkers.Dispose(); } catch { }
         try { MapLinkAutoConverter.Dispose(); } catch { }
         try { HuntAutoCapture.Dispose(); } catch { }

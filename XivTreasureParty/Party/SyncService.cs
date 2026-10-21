@@ -52,7 +52,10 @@ public sealed class SyncService
         _stream = stream;
     }
 
-    public void Start(string partyCode)
+    /// <summary>重建三條串流；插件已開始卸載時什麼都不開並回 false。</summary>
+    public bool Start(string partyCode) => Plugin.RunIfNotUnloading(() => StartCore(partyCode));
+
+    private void StartCore(string partyCode)
     {
         Stop();
         _currentCode = partyCode;
@@ -190,8 +193,7 @@ public sealed class SyncService
         if (_membersSub == null || _treasuresSub == null || _metaSub == null)
         {
             Plugin.Log.Information($"[Sync] 手動重新連線：訂閱不存在，重新建立三條串流（隊伍 {code}）。");
-            Start(code!);
-            return true;
+            return Start(code!);
         }
 
         Plugin.Log.Information($"[Sync] 手動重新連線：要求三條串流立刻重試（隊伍 {code}）。");
