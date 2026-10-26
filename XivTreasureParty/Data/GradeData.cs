@@ -29,7 +29,12 @@ public static class GradeData
         new() { Grade = "G9", ItemId = 17835, Name = "陳舊的迦迦納怪鳥革地圖", PartySize = 1, Expansion = "4.0" },
         new() { Grade = "G8", ItemId = 12243, Name = "陳舊的巨龍革地圖", PartySize = 8, Expansion = "3.0" },
         new() { Grade = "G7", ItemId = 12242, Name = "陳舊的飛龍革地圖", PartySize = 1, Expansion = "3.0" },
-        new() { Grade = "G6", ItemId = 12241, Name = "陳舊的古鳥革地圖", PartySize = 1, Expansion = "3.0" }
+        new() { Grade = "G6", ItemId = 12241, Name = "陳舊的古鳥革地圖", PartySize = 1, Expansion = "3.0" },
+        new() { Grade = "G5", ItemId = 6692, Name = "陳舊的地圖G5", PartySize = 8, Expansion = "2.0" },
+        new() { Grade = "G4", ItemId = 6691, Name = "陳舊的地圖G4", PartySize = 1, Expansion = "2.0" },
+        new() { Grade = "G3", ItemId = 6690, Name = "陳舊的地圖G3", PartySize = 1, Expansion = "2.0" },
+        new() { Grade = "G2", ItemId = 6689, Name = "陳舊的地圖G2", PartySize = 1, Expansion = "2.0" },
+        new() { Grade = "G1", ItemId = 6688, Name = "陳舊的地圖G1", PartySize = 1, Expansion = "2.0" }
     };
 
     private static readonly Dictionary<int, TreasureGrade> ByItemId = All.ToDictionary(g => g.ItemId);
