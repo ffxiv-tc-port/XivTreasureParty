@@ -299,7 +299,7 @@ public sealed class MappyMarkerBridge : IDisposable
         var grade = GradeData.GetByItemId(treasure.GradeItemId);
         var gradeLabel = grade == null
             ? $"藏寶圖 #{treasure.GradeItemId}"
-            : $"{grade.Grade} {grade.Name}";
+            : grade.Label;
 
         var owner = FirstNonBlank(treasure.Player, treasure.AddedByNickname) ?? "(未指定)";
 

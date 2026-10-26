@@ -32,13 +32,13 @@ public sealed class AddTreasurePanel
         var currentGrade = grades[_gradeIndex];
 
         ImGui.SetNextItemWidth(-1);
-        if (ImGui.BeginCombo("##grade", $"{currentGrade.Grade} {currentGrade.Name}"))
+        if (ImGui.BeginCombo("##grade", currentGrade.Label))
         {
             for (var i = 0; i < grades.Count; i++)
             {
                 var g = grades[i];
                 var selected = i == _gradeIndex;
-                var label = $"{g.Grade} {g.Name} [{(g.PartySize == 8 ? "8人" : "單人")}]";
+                var label = $"{g.Label} [{(g.PartySize == 8 ? "8人" : "單人")}]";
                 if (ImGui.Selectable(label, selected))
                 {
                     _gradeIndex = i;
