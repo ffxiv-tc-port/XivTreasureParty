@@ -39,6 +39,11 @@ public static class AetheryteData
             new("雷轉質礦場", 17.1f, 23.9f),
             new("邊郊鎮", 17.0f, 9.8f),
         },
+        [4510] = new Aetheryte[] {
+            new("憶之節點", 21.5f, 37.5f),
+            new("火之節點", 34.7f, 15.8f),
+            new("風之節點", 16.4f, 13.6f),
+        },
 
         // === 6.0 曉月終焉 ===
         [3708] = new Aetheryte[] {

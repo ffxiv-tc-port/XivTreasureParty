@@ -20,6 +20,7 @@ public static class GradeData
 {
     public static readonly IReadOnlyList<TreasureGrade> All = new List<TreasureGrade>
     {
+        new() { Grade = "G18", ItemId = 46185, Name = "陳舊的地圖G18", PartySize = 8, Expansion = "7.3" },
         new() { Grade = "G17", ItemId = 43557, Name = "陳舊的地圖G17", PartySize = 8, Expansion = "7.0" },
         new() { Grade = "G16", ItemId = 43556, Name = "陳舊的地圖G16", PartySize = 1, Expansion = "7.0" },
         new() { Grade = "G15", ItemId = 39591, Name = "陳舊的地圖G15", PartySize = 8, Expansion = "6.3" },
