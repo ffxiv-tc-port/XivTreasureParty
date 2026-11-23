@@ -19,8 +19,8 @@ public sealed class PluginWindow
     {
         if (!IsOpen) return;
 
-        ImGui.SetNextWindowSize(new Vector2(820, 540), ImGuiCond.FirstUseEver);
-        ImGui.SetNextWindowSizeConstraints(new Vector2(640, 420), new Vector2(1600, 1200));
+        ImGui.SetNextWindowSize(UiScale.Px(820, 540), ImGuiCond.FirstUseEver);
+        ImGui.SetNextWindowSizeConstraints(UiScale.Px(640, 420), UiScale.Px(1600, 1200));
 
         var open = IsOpen;
         if (!ImGui.Begin("XIV 藏寶圖工具小幫手", ref open))
@@ -34,7 +34,7 @@ public sealed class PluginWindow
         try
         {
             var avail = ImGui.GetContentRegionAvail();
-            var leftWidth = MathF.Max(260f, avail.X * 0.38f);
+            var leftWidth = MathF.Max(UiScale.Px(260f), avail.X * 0.38f);
 
             if (ImGui.BeginChild("##left", new Vector2(leftWidth, 0), true))
             {

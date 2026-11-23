@@ -28,7 +28,7 @@ public sealed class TreasureListPanel
         ImGui.AlignTextToFramePadding();
         ImGui.TextUnformatted("發送頻道指令");
         ImGui.SameLine();
-        ImGui.SetNextItemWidth(90f);
+        ImGui.SetNextItemWidth(UiScale.Px(90f));
         var commandCommitted = ImGui.InputText(
             "##treasure-chat-command",
             ref _chatCommandBuf,
@@ -73,12 +73,12 @@ public sealed class TreasureListPanel
         if (ImGui.BeginTable("##treasures", 6,
             ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH | ImGuiTableFlags.ScrollY | ImGuiTableFlags.SizingStretchProp))
         {
-            ImGui.TableSetupColumn("順序", ImGuiTableColumnFlags.WidthFixed, 40f);
-            ImGui.TableSetupColumn("等級", ImGuiTableColumnFlags.WidthFixed, 60f);
+            ImGui.TableSetupColumn("順序", ImGuiTableColumnFlags.WidthFixed, UiScale.Px(40f));
+            ImGui.TableSetupColumn("等級", ImGuiTableColumnFlags.WidthFixed, UiScale.Px(60f));
             ImGui.TableSetupColumn("地點 / 座標", ImGuiTableColumnFlags.WidthStretch, 2f);
             ImGui.TableSetupColumn("負責玩家", ImGuiTableColumnFlags.WidthStretch, 1.2f);
             ImGui.TableSetupColumn("備註", ImGuiTableColumnFlags.WidthStretch, 1.2f);
-            ImGui.TableSetupColumn("操作", ImGuiTableColumnFlags.WidthFixed, 320f);
+            ImGui.TableSetupColumn("操作", ImGuiTableColumnFlags.WidthFixed, UiScale.Px(320f));
             ImGui.TableHeadersRow();
 
             for (var i = 0; i < treasures.Count; i++)
