@@ -39,6 +39,12 @@ public sealed class BackendEndpoint
     /// <summary>憑證分槽用的身分：資料庫、換證端點、API key 任一不同就是不同的槽。</summary>
     public string SlotId { get; }
 
+    /// <summary>
+    /// 是 Firebase 本身（cycleapple，或使用者自開、填了 API key 的 Firebase）：可以走 WebSocket 即時協定。
+    /// 自架臨時伺服器（沒填 key）只實作 REST／SSE。
+    /// </summary>
+    public bool SupportsRealtime => Kind == BackendKind.Cycleapple || ApiKey != PlaceholderApiKey;
+
     private BackendEndpoint(BackendKind kind, string databaseUrl, string apiKey,
                             string identityToolkitBase, string secureTokenBase, string displayHost)
     {

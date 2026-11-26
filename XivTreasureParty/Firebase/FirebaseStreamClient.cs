@@ -50,6 +50,18 @@ public sealed class StreamStatus
     public int? LastStatusCode { get; init; }
 }
 
+/// <summary>同步用的一個訂閱：SSE 的一條串流，或 WebSocket 連線上的一個監聽。</summary>
+public interface ISyncSubscription : IDisposable
+{
+    string Path { get; }
+
+    /// <summary>目前狀態的不可變快照，繪製執行緒可直接讀。</summary>
+    StreamStatus Status { get; }
+
+    /// <summary>立刻重試一次（插隊，不取消退避策略）。</summary>
+    void RequestImmediateRetry();
+}
+
 /// <summary>Firebase 回報登入憑證已失效（auth_revoked）。要重新取得憑證才能重連。</summary>
 public sealed class FirebaseAuthRevokedException : FirebaseException
 {
@@ -114,9 +126,10 @@ public sealed class FirebaseStreamClient : IDisposable
         _auth = auth;
     }
 
-    public StreamSubscription Subscribe(string path, Action<StreamEvent> onEvent, Action<Exception>? onError = null)
+    /// <param name="onConnected">每次連上（收到回應標頭）時在串流的執行緒上呼叫。</param>
+    public StreamSubscription Subscribe(string path, Action<StreamEvent> onEvent, Action<Exception>? onError = null, Action? onConnected = null)
     {
-        var sub = new StreamSubscription(this, path, onEvent, onError);
+        var sub = new StreamSubscription(this, path, onEvent, onError, onConnected);
         _subscriptions.TryAdd(sub.Id, sub);
         sub.Start();
         return sub;
@@ -160,7 +173,7 @@ public sealed class FirebaseStreamClient : IDisposable
         Plugin.Log.Information($"[Stream {path}] 伺服器回應 HTTP {ex.StatusCode}，內容：{(ex.Body.Length == 0 ? "（空白）" : StreamHttpException.Shorten(ex.Body, 500))}（同一種回應只記這一次）");
     }
 
-    public sealed class StreamSubscription : IDisposable
+    public sealed class StreamSubscription : ISyncSubscription
     {
         private const int InitialBackoffMs = 1000;
 
@@ -193,6 +206,7 @@ public sealed class FirebaseStreamClient : IDisposable
         private readonly string _path;
         private readonly Action<StreamEvent> _onEvent;
         private readonly Action<Exception>? _onError;
+        private readonly Action? _onConnected;
         private readonly CancellationTokenSource _cts = new();
         private readonly object _attemptLock = new();
 
@@ -213,12 +227,14 @@ public sealed class FirebaseStreamClient : IDisposable
         /// <summary>目前狀態的快照（整體參考指派，繪製執行緒可直接讀）。</summary>
         public StreamStatus Status => _status;
 
-        public StreamSubscription(FirebaseStreamClient owner, string path, Action<StreamEvent> onEvent, Action<Exception>? onError)
+        public StreamSubscription(FirebaseStreamClient owner, string path, Action<StreamEvent> onEvent, Action<Exception>? onError,
+                                  Action? onConnected = null)
         {
             _owner = owner;
             _path = path;
             _onEvent = onEvent;
             _onError = onError;
+            _onConnected = onConnected;
         }
 
         public void Start()
@@ -521,6 +537,8 @@ public sealed class FirebaseStreamClient : IDisposable
             Interlocked.Exchange(ref _connectedSinceTicks, DateTime.UtcNow.Ticks);
             Publish(StreamConnectionState.Connected, 0, null, null);
             LogConnected(previous);
+            try { _onConnected?.Invoke(); }
+            catch (Exception ex) { Plugin.Log.Warning($"[Stream {_path}] 已連線回呼失敗：{ex.Message}"); }
 
             // 讀取停滯看門狗：每收到一行就重新計時；整段都沒動靜就取消讀取，讓外層走重連。
             using var readCts = CancellationTokenSource.CreateLinkedTokenSource(ct);

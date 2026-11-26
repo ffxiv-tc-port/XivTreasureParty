@@ -62,6 +62,12 @@ public class Configuration : IPluginConfiguration
     /// </summary>
     public bool SingleStreamSync { get; set; } = true;
 
+    /// <summary>
+    /// Firebase 後端用和網頁版相同的 WebSocket 連線（換證不斷線）；用不了時自動退回 SSE。
+    /// 關掉＝一律 SSE（舊行為）。下次建立／加入隊伍才生效。
+    /// </summary>
+    public bool RealtimeSync { get; set; } = true;
+
     // ── 臨時伺服器 ──
     // 契約：上面的 LastPartyCode／Last*Token／LastLocalId／Nickname 就是 cycleapple 那一槽（既有使用者不搬資料）；
     // 自訂後端只讀寫 Custom* 欄位，而且 CustomCredentialOwner 對不上目前端點時整組視為沒有。

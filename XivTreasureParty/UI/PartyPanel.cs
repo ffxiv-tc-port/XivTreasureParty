@@ -114,7 +114,7 @@ public sealed class PartyPanel
     }
 
     /// <summary>
-    /// 同步靠 SSE 長連線（一條或三條），斷掉時畫面上必須看得出來。
+    /// 同步靠長連線（WebSocket 一條，或 SSE 一條／三條），斷掉時畫面上必須看得出來。
     /// 「不知道」也要看得見：從沒收過資料時顯示「?」而不是 0。
     /// </summary>
     private void DrawConnectionRow()
@@ -203,16 +203,22 @@ public sealed class PartyPanel
         var what = custom ? $"與臨時伺服器 {endpoint.DisplayHost} 的即時連線" : "與網頁版共享房間的即時連線";
         sb.AppendLine(info.Total == 0
             ? what + "。"
-            : info.Single
-                ? what + "（成員／藏寶圖／隊伍設定合併成一條）。"
-                : what + "（成員／藏寶圖／隊伍設定共三條）。");
+            : info.Realtime
+                ? what + (info.Single
+                    ? "（WebSocket，和網頁版相同：1 條連線，整個隊伍一起監聽）。"
+                    : "（WebSocket，和網頁版相同：1 條連線，成員／藏寶圖／隊伍設定分三個監聽）。")
+                : info.Single
+                    ? what + "（SSE，成員／藏寶圖／隊伍設定合併成一條）。"
+                    : what + "（SSE，成員／藏寶圖／隊伍設定共三條）。");
         if (info.LastStatusCode == 402)
             sb.AppendLine(custom
                 ? "臨時伺服器回應 402（連線已滿或額度用完），稍後自動重試。"
                 : "cycleapple 伺服器同時連線已滿（免費方案上限 100），稍後自動重試。");
         sb.AppendLine(info.Total == 0
             ? (inParty ? "目前串流數: 0（訂閱不存在，可按「重新連線」重建）" : "目前串流數: 0（尚未加入隊伍）")
-            : $"已連上 {info.Connected}/{info.Total} 條");
+            : info.Realtime
+                ? $"已連上 {info.Connected}/{info.Total} 個監聽"
+                : $"已連上 {info.Connected}/{info.Total} 條");
 
         sb.AppendLine(info.LastEventUtc is { } last
             ? $"最後收到資料: {Math.Max(0, (int)(DateTime.UtcNow - last).TotalSeconds)} 秒前"
@@ -609,7 +615,20 @@ public sealed class PartyPanel
         if (ImGui.IsItemHovered())
             ImGui.SetTooltip("開啟（預設）時每人只佔同步伺服器 1 條連線，原本是 3 條；伺服器同時連線有上限，佔得越少越不容易被擋。\n"
                              + "伺服器不准用一條連線讀整個隊伍時，會自動改回 3 條。\n"
+                             + "使用 WebSocket 時不論一條或三條都只佔 1 條連線，這個選項只影響 SSE。\n"
                              + "改這個選項下次建立／加入隊伍才生效。");
+
+        var realtime = cfg.RealtimeSync;
+        if (ImGui.Checkbox("和網頁版相同的連線方式（WebSocket）", ref realtime))
+        {
+            cfg.RealtimeSync = realtime;
+            cfg.Save();
+        }
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("開啟（預設）時，連 cycleapple 或自己的 Firebase 會用和網頁版相同的 WebSocket 連線：\n"
+                             + "每小時換登入憑證時不必斷線重連，伺服器連線快滿時不會在換證那一刻被搶走位子。\n"
+                             + "WebSocket 連不上或看不懂時會自動改用原本的 SSE 連線。臨時伺服器一律用 SSE。\n"
+                             + "關掉＝一律用 SSE（舊行為）。改這個選項下次建立／加入隊伍才生效。");
     }
 
     /// <summary>停用區段裡面的說明框照樣全亮（BeginDisabled 會把之後開的視窗一起調暗）。</summary>

@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Text.Json;
 using System.Threading;
@@ -8,9 +9,10 @@ using XivTreasureParty.Party.Models;
 namespace XivTreasureParty.Party;
 
 /// <summary>
-/// 對應網頁版 sync-service.js — 透過 Firebase SSE 監聽隊伍的 members / treasures / meta。
-/// 預設只開一條訂閱整個 <c>parties/{code}</c>，依事件 path 分給三個處理器；
-/// 伺服器不准讀整個隊伍節點時，自動改回三條各訂一個子節點（舊作法，網頁版也是分三個監聽）。
+/// 對應網頁版 sync-service.js — 監聽隊伍的 members / treasures / meta。
+/// Firebase 後端預設走 WebSocket（和網頁版同一套協定，1 條連線）；用不了就退回 SSE。
+/// 預設只開一個訂閱整個 <c>parties/{code}</c>，依事件 path 分給三個處理器；
+/// 伺服器不准讀整個隊伍節點時，自動改回三個各訂一個子節點（舊作法，網頁版也是分三個監聽）。
 /// </summary>
 /// <remarks>
 /// 執行緒契約：<see cref="Members"/>／<see cref="Treasures"/> 是「發佈後結構不再改」的快照，
@@ -22,13 +24,24 @@ public sealed class SyncService
     private static readonly string[] ChildNodes = { "members", "treasures", "meta" };
 
     private readonly FirebaseStreamClient _stream;
+    private readonly FirebaseRealtimeClient? _realtime;
     private readonly Func<bool> _preferSingleStream;
+    private readonly Func<bool> _preferRealtime;
 
     private readonly object _subLock = new();
-    private volatile FirebaseStreamClient.StreamSubscription? _partySub;
-    private volatile FirebaseStreamClient.StreamSubscription? _membersSub;
-    private volatile FirebaseStreamClient.StreamSubscription? _treasuresSub;
-    private volatile FirebaseStreamClient.StreamSubscription? _metaSub;
+    private volatile ISyncSubscription? _partySub;
+    private volatile ISyncSubscription? _membersSub;
+    private volatile ISyncSubscription? _treasuresSub;
+    private volatile ISyncSubscription? _metaSub;
+
+    /// <summary>目前這一輪的訂閱走 WebSocket；退回 SSE 後為 false。只在 <c>_subLock</c> 內改。</summary>
+    private volatile bool _usingRealtime;
+
+    /// <summary>「已連上，連線方式是…」那行上次記的是哪一輪哪一種（每輪每種只記一次）。</summary>
+    private string? _connectLogKey;
+
+    /// <summary>WebSocket 退回 SSE 的原因（同一種整個插件生命期只記一次）。</summary>
+    private readonly ConcurrentDictionary<string, byte> _loggedFallbacks = new();
 
     /// <summary>每次 Start／Stop 加一；退回三條的回呼對不上目前世代就作廢（那條訂閱早就被換掉了）。</summary>
     private int _generation;
@@ -60,12 +73,17 @@ public sealed class SyncService
     public event Action? MetaChanged;
     public event Action<Exception>? SyncError;
 
-    /// <param name="stream">串流用戶端。</param>
+    /// <param name="stream">SSE 串流用戶端（WebSocket 用不了或沒開時用）。</param>
     /// <param name="preferSingleStream">每次 Start 時讀一次；null＝讀設定 <c>SingleStreamSync</c>。</param>
-    public SyncService(FirebaseStreamClient stream, Func<bool>? preferSingleStream = null)
+    /// <param name="realtime">WebSocket 用戶端；null＝只用 SSE。</param>
+    /// <param name="preferRealtime">每次 Start 時讀一次；null＝設定 <c>RealtimeSync</c> 且目前後端是 Firebase。</param>
+    public SyncService(FirebaseStreamClient stream, Func<bool>? preferSingleStream = null,
+                       FirebaseRealtimeClient? realtime = null, Func<bool>? preferRealtime = null)
     {
         _stream = stream;
+        _realtime = realtime;
         _preferSingleStream = preferSingleStream ?? (() => Plugin.Config.SingleStreamSync);
+        _preferRealtime = preferRealtime ?? (() => Plugin.Config.RealtimeSync && Plugin.Backend.Current.SupportsRealtime);
     }
 
     /// <summary>重建串流；插件已開始卸載時什麼都不開並回 false。</summary>
@@ -77,42 +95,116 @@ public sealed class SyncService
         lock (_subLock)
         {
             _currentCode = partyCode;
-            var generation = _generation;
-            bool single;
-            lock (_singleDeniedDatabases)
-                single = _preferSingleStream() && !_singleDeniedDatabases.Contains(_stream.DatabaseUrl);
-
-            if (single)
-                SubscribeSingle(partyCode, generation);
-            else
-                SubscribeTriple(partyCode);
+            _usingRealtime = _realtime != null && _preferRealtime();
+            SubscribeLocked(partyCode, _generation);
         }
+    }
+
+    /// <summary>照目前的傳輸方式開一個或三個訂閱。呼叫端持有 <c>_subLock</c>。</summary>
+    private void SubscribeLocked(string partyCode, int generation)
+    {
+        bool single;
+        lock (_singleDeniedDatabases)
+            single = _preferSingleStream() && !_singleDeniedDatabases.Contains(CurrentDatabaseUrl);
+
+        if (single)
+            SubscribeSingle(partyCode, generation);
+        else
+            SubscribeTriple(partyCode, generation);
+    }
+
+    private string CurrentDatabaseUrl => _usingRealtime ? _realtime!.DatabaseUrl : _stream.DatabaseUrl;
+
+    private ISyncSubscription Open(string path, Action<StreamEvent> onEvent, Action<Exception> onError,
+                                   string partyCode, int generation, bool single)
+    {
+        var mode = (_usingRealtime ? "ws" : "sse") + (single ? "1" : "3");
+        void OnConnected() => LogConnectedOnce(generation, mode, partyCode);
+        return _usingRealtime
+            ? _realtime!.Listen(path, onEvent, onError, OnConnected)
+            : _stream.Subscribe(path, onEvent, onError, OnConnected);
     }
 
     private void SubscribeSingle(string partyCode, int generation)
     {
-        _partySub = _stream.Subscribe(
+        _partySub = Open(
             $"parties/{partyCode}",
             ev => RunSafeOnFrameworkThread(() => ApplyPartyEvent(ev), "party"),
-            ex => OnSingleStreamError(ex, partyCode, generation));
+            ex => OnSingleStreamError(ex, partyCode, generation),
+            partyCode, generation, single: true);
     }
 
-    private void SubscribeTriple(string partyCode)
+    private void SubscribeTriple(string partyCode, int generation)
     {
-        _membersSub = _stream.Subscribe(
+        _membersSub = Open(
             $"parties/{partyCode}/members",
             ev => RunSafeOnFrameworkThread(() => ApplyMembers(ev), "members"),
-            ex => SyncError?.Invoke(ex));
+            ex => OnStreamError(ex, partyCode, generation),
+            partyCode, generation, single: false);
 
-        _treasuresSub = _stream.Subscribe(
+        _treasuresSub = Open(
             $"parties/{partyCode}/treasures",
             ev => RunSafeOnFrameworkThread(() => ApplyTreasures(ev), "treasures"),
-            ex => SyncError?.Invoke(ex));
+            ex => OnStreamError(ex, partyCode, generation),
+            partyCode, generation, single: false);
 
-        _metaSub = _stream.Subscribe(
+        _metaSub = Open(
             $"parties/{partyCode}/meta",
             ev => RunSafeOnFrameworkThread(() => HandleMeta(ev), "meta"),
-            ex => SyncError?.Invoke(ex));
+            ex => OnStreamError(ex, partyCode, generation),
+            partyCode, generation, single: false);
+    }
+
+    private void OnStreamError(Exception ex, string partyCode, int generation)
+    {
+        if (ex is RealtimeUnavailableException unavailable)
+        {
+            FallBackToSse(unavailable, partyCode, generation);
+            return;
+        }
+        try { SyncError?.Invoke(ex); } catch { }
+    }
+
+    /// <summary>WebSocket 用不了：這一輪改走 SSE（之後照 SSE 的規則決定一條或三條）。下次建立／加入隊伍會再試 WebSocket。</summary>
+    private void FallBackToSse(RealtimeUnavailableException ex, string partyCode, int generation)
+    {
+        Plugin.RunIfNotUnloading(() =>
+        {
+            lock (_subLock)
+            {
+                if (generation != _generation || !_usingRealtime) return;
+                _generation++;
+                DisposeSubscriptionsLocked();
+                _usingRealtime = false;
+                if (_loggedFallbacks.TryAdd(ex.ReasonKey, 0))
+                    Plugin.Log.Information($"[Sync] 和網頁版相同的連線方式（WebSocket）用不了：{ex.Message}；改用 SSE 連線（隊伍 {partyCode}，同一種原因只記這一次）");
+                SubscribeLocked(partyCode, _generation);
+            }
+        });
+    }
+
+    private void DisposeSubscriptionsLocked()
+    {
+        _partySub?.Dispose(); _partySub = null;
+        _membersSub?.Dispose(); _membersSub = null;
+        _treasuresSub?.Dispose(); _treasuresSub = null;
+        _metaSub?.Dispose(); _metaSub = null;
+    }
+
+    /// <summary>每次加入隊伍、每種連線方式記一行：從實機 log 就看得出實際走哪一種連線方式。</summary>
+    private void LogConnectedOnce(int generation, string mode, string partyCode)
+    {
+        if (generation != Volatile.Read(ref _generation)) return;
+        var key = $"{generation}|{mode}";
+        if (Interlocked.Exchange(ref _connectLogKey, key) == key) return;
+        var text = mode switch
+        {
+            "ws1" => "WebSocket（和網頁版相同；1 條連線，整個隊伍 1 個監聽）",
+            "ws3" => "WebSocket（和網頁版相同；1 條連線，成員／藏寶圖／隊伍設定 3 個監聽）",
+            "sse1" => "SSE（1 條連線）",
+            _ => "SSE（成員／藏寶圖／隊伍設定 3 條連線）",
+        };
+        Plugin.Log.Information($"[Sync] 隊伍 {partyCode} 已連上，連線方式：{text}");
     }
 
     /// <summary>
@@ -122,6 +214,11 @@ public sealed class SyncService
     /// <remarks>刻意不只認「Permission denied」字樣：正式伺服器拒讀的回應內容沒有證據，認錯就會整個隊伍永遠連不上；誤退三條只是少省連線。</remarks>
     private void OnSingleStreamError(Exception ex, string partyCode, int generation)
     {
+        if (ex is RealtimeUnavailableException unavailable)
+        {
+            FallBackToSse(unavailable, partyCode, generation);
+            return;
+        }
         try { SyncError?.Invoke(ex); } catch { }
 
         var denied = ex is StreamCancelledException || ex is StreamHttpException { StatusCode: 401 or 403 };
@@ -133,11 +230,13 @@ public sealed class SyncService
             {
                 if (generation != _generation || _partySub == null) return;
 
-                lock (_singleDeniedDatabases) _singleDeniedDatabases.Add(_stream.DatabaseUrl);
+                lock (_singleDeniedDatabases) _singleDeniedDatabases.Add(CurrentDatabaseUrl);
                 _partySub.Dispose();
                 _partySub = null;
-                Plugin.Log.Information($"[Sync] 伺服器不准用一條連線讀整個隊伍（{ex.Message}），改回成員／藏寶圖／隊伍設定三條連線（隊伍 {partyCode}）");
-                SubscribeTriple(partyCode);
+                Plugin.Log.Information(_usingRealtime
+                    ? $"[Sync] 伺服器不准用一個監聽讀整個隊伍（{ex.Message}），同一條 WebSocket 連線改成成員／藏寶圖／隊伍設定三個監聽（隊伍 {partyCode}）"
+                    : $"[Sync] 伺服器不准用一條連線讀整個隊伍（{ex.Message}），改回成員／藏寶圖／隊伍設定三條連線（隊伍 {partyCode}）");
+                SubscribeTriple(partyCode, generation);
             }
         });
     }
@@ -169,10 +268,7 @@ public sealed class SyncService
         lock (_subLock)
         {
             _generation++;
-            _partySub?.Dispose(); _partySub = null;
-            _membersSub?.Dispose(); _membersSub = null;
-            _treasuresSub?.Dispose(); _treasuresSub = null;
-            _metaSub?.Dispose(); _metaSub = null;
+            DisposeSubscriptionsLocked();
             _currentCode = null;
         }
 
@@ -190,6 +286,9 @@ public sealed class SyncService
 
     /// <summary>目前是合併的單條串流（false＝三條或沒有訂閱）。</summary>
     public bool IsSingleStream => _partySub != null;
+
+    /// <summary>目前的訂閱走 WebSocket（false＝SSE 或沒有訂閱）。</summary>
+    public bool IsRealtime => _usingRealtime && HasSubscriptions;
 
     /// <summary>還有任何訂閱存在（含退避中的）。</summary>
     public bool HasSubscriptions => _partySub != null || _membersSub != null || _treasuresSub != null || _metaSub != null;
@@ -253,6 +352,7 @@ public sealed class SyncService
             info.State = StreamConnectionState.Idle;
 
         info.Single = party != null;
+        info.Realtime = _usingRealtime && info.Total > 0;
         return info;
     }
 
@@ -274,7 +374,7 @@ public sealed class SyncService
             return false;
         }
 
-        FirebaseStreamClient.StreamSubscription?[] subs;
+        ISyncSubscription?[] subs;
         lock (_subLock)
         {
             subs = _partySub != null
@@ -655,6 +755,9 @@ public sealed class SyncConnectionInfo
 
     /// <summary>目前是合併的單條串流。</summary>
     public bool Single { get; set; }
+
+    /// <summary>目前走 WebSocket：不論一個或三個監聽都只佔 1 條連線。</summary>
+    public bool Realtime { get; set; }
 
     /// <summary>目前有幾條串流。</summary>
     public int Total { get; set; }

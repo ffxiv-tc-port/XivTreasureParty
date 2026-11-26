@@ -36,6 +36,7 @@ public sealed class Plugin : IDalamudPlugin
     public static FirebaseAuthClient FirebaseAuth { get; private set; } = null!;
     public static FirebaseDatabaseClient FirebaseDb { get; private set; } = null!;
     public static FirebaseStreamClient FirebaseStream { get; private set; } = null!;
+    public static FirebaseRealtimeClient FirebaseRealtime { get; private set; } = null!;
 
     public static PartyService PartyService { get; private set; } = null!;
     public static SyncService SyncService { get; private set; } = null!;
@@ -87,9 +88,10 @@ public sealed class Plugin : IDalamudPlugin
         FirebaseAuth = new FirebaseAuthClient(Backend);
         FirebaseDb = new FirebaseDatabaseClient(Backend, FirebaseAuth);
         FirebaseStream = new FirebaseStreamClient(() => Backend.Current.DatabaseUrl, FirebaseAuth);
+        FirebaseRealtime = new FirebaseRealtimeClient(() => Backend.Current.DatabaseUrl, FirebaseAuth);
 
         PartyService = new PartyService(FirebaseDb, FirebaseAuth, Backend);
-        SyncService = new SyncService(FirebaseStream);
+        SyncService = new SyncService(FirebaseStream, realtime: FirebaseRealtime);
         Heartbeat = new HeartbeatService(FirebaseDb, PartyService, FirebaseAuth);
         ChatSender = new ChatSender();
         HuntReader = new TreasureHuntReader(gameInterop);
@@ -158,7 +160,8 @@ public sealed class Plugin : IDalamudPlugin
             if (_unloading) { reason = "插件正在卸載"; return false; }
             if (PartyService.IsInParty) { reason = "先離開隊伍才能切換"; return false; }
             if (AutoRejoinInProgress) { reason = "正在自動重新加入上次的隊伍，請稍候"; return false; }
-            if (SyncService.HasSubscriptions || FirebaseStream.ActiveSubscriptions.Count > 0) { reason = "同步連線還沒關閉，請稍候再試"; return false; }
+            if (SyncService.HasSubscriptions || FirebaseStream.ActiveSubscriptions.Count > 0 || FirebaseRealtime.ActiveListenCount > 0)
+            { reason = "同步連線還沒關閉，請稍候再試"; return false; }
             if (Backend.Current.SlotId != endpoint.SlotId)
             {
                 Backend.Set(endpoint);
@@ -239,6 +242,7 @@ public sealed class Plugin : IDalamudPlugin
         try { Heartbeat.Stop(); } catch { }
         try { SyncService.Stop(); } catch { }
         try { FirebaseStream.Dispose(); } catch { }
+        try { FirebaseRealtime.Dispose(); } catch { }
         try { FirebaseAuth.Dispose(); } catch { }
 
         CommandManager.RemoveHandler(CommandMain);
