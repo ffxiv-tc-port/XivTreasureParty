@@ -8,11 +8,19 @@ using System.Threading.Tasks;
 
 namespace XivTreasureParty.Firebase;
 
+/// <summary>
+/// 匿名登入與換證。憑證按後端分槽（<see cref="Configuration.GetCredentials"/>）：
+/// 每次呼叫先看請求要去的端點，記憶體裡載的不是那一槽就換槽，
+/// 所以某個後端的 refresh token 只會送到同一個後端的換證端點。
+/// </summary>
 public sealed class FirebaseAuthClient : IDisposable
 {
-    private readonly string _apiKey;
+    private readonly BackendSelector _backend;
     private readonly HttpClient _http = new();
     private readonly SemaphoreSlim _mutex = new(1, 1);
+
+    /// <summary>記憶體裡這組憑證屬於哪一槽（<see cref="BackendEndpoint.SlotId"/>）；null＝還沒載。</summary>
+    private string? _loadedSlot;
 
     public string? IdToken { get; private set; }
     public string? RefreshToken { get; private set; }
@@ -21,19 +29,10 @@ public sealed class FirebaseAuthClient : IDisposable
 
     public bool IsSignedIn => !string.IsNullOrEmpty(IdToken) && !string.IsNullOrEmpty(LocalId);
 
-    public FirebaseAuthClient(string apiKey)
+    public FirebaseAuthClient(BackendSelector backend)
     {
-        _apiKey = apiKey;
+        _backend = backend;
         _http.Timeout = TimeSpan.FromSeconds(30);
-
-        var cfg = Plugin.Config;
-        if (!string.IsNullOrEmpty(cfg.LastIdToken) && !string.IsNullOrEmpty(cfg.LastRefreshToken))
-        {
-            IdToken = cfg.LastIdToken;
-            RefreshToken = cfg.LastRefreshToken;
-            LocalId = cfg.LastLocalId;
-            TokenExpiresAtUtc = cfg.LastTokenRefreshedAtUtc?.AddMinutes(55) ?? DateTime.MinValue;
-        }
     }
 
     /// <summary>
@@ -47,11 +46,18 @@ public sealed class FirebaseAuthClient : IDisposable
         TokenExpiresAtUtc = DateTime.MinValue;
     }
 
-    public async Task<string> EnsureSignedInAsync(CancellationToken ct = default)
+    public Task<string> EnsureSignedInAsync(CancellationToken ct = default) =>
+        EnsureSignedInAsync(_backend.Current, ct);
+
+    /// <summary>取得 <paramref name="endpoint"/> 那一槽的有效 ID token；呼叫端拿它去打同一個端點的資料庫。</summary>
+    public async Task<string> EnsureSignedInAsync(BackendEndpoint endpoint, CancellationToken ct = default)
     {
         await _mutex.WaitAsync(ct).ConfigureAwait(false);
         try
         {
+            if (_loadedSlot != endpoint.SlotId)
+                LoadSlot(endpoint);
+
             // 刻意不寫成 TokenExpiresAtUtc - TimeSpan.FromMinutes(2)：InvalidateToken() 會把 TokenExpiresAtUtc 設成 DateTime.MinValue，
             // 建構子在設定檔沒有 LastTokenRefreshedAtUtc 時也會給 MinValue；對 MinValue 做減法會擲 ArgumentOutOfRangeException。
             // 這是認證的第一道判斷，炸在這裡等於建立隊伍／加入隊伍／心跳／串流重連全部失效。
@@ -63,7 +69,7 @@ public sealed class FirebaseAuthClient : IDisposable
             {
                 try
                 {
-                    await RefreshAsyncInternal(ct).ConfigureAwait(false);
+                    await RefreshAsyncInternal(endpoint, ct).ConfigureAwait(false);
                     return IdToken!;
                 }
                 catch (Exception ex)
@@ -72,7 +78,7 @@ public sealed class FirebaseAuthClient : IDisposable
                 }
             }
 
-            await SignInAnonymouslyAsyncInternal(ct).ConfigureAwait(false);
+            await SignInAnonymouslyAsyncInternal(endpoint, ct).ConfigureAwait(false);
             return IdToken!;
         }
         finally
@@ -81,14 +87,32 @@ public sealed class FirebaseAuthClient : IDisposable
         }
     }
 
-    public async Task<string> GetFreshTokenAsync(CancellationToken ct = default)
+    public Task<string> GetFreshTokenAsync(CancellationToken ct = default) => EnsureSignedInAsync(ct);
+
+    private void LoadSlot(BackendEndpoint endpoint)
     {
-        return await EnsureSignedInAsync(ct).ConfigureAwait(false);
+        var (idToken, refreshToken, localId, refreshedAt) = Plugin.Config.GetCredentials(endpoint);
+        if (!string.IsNullOrEmpty(idToken) && !string.IsNullOrEmpty(refreshToken))
+        {
+            IdToken = idToken;
+            RefreshToken = refreshToken;
+            LocalId = localId;
+            TokenExpiresAtUtc = refreshedAt?.AddMinutes(55) ?? DateTime.MinValue;
+        }
+        else
+        {
+            IdToken = RefreshToken = LocalId = null;
+            TokenExpiresAtUtc = DateTime.MinValue;
+        }
+        _loadedSlot = endpoint.SlotId;
     }
 
-    private async Task SignInAnonymouslyAsyncInternal(CancellationToken ct)
+    private static string Label(BackendEndpoint endpoint) =>
+        endpoint.Kind == BackendKind.Custom ? "臨時伺服器" : "Firebase";
+
+    private async Task SignInAnonymouslyAsyncInternal(BackendEndpoint endpoint, CancellationToken ct)
     {
-        var url = $"{FirebaseConfig.IdentityToolkitBase}/accounts:signUp?key={_apiKey}";
+        var url = $"{endpoint.IdentityToolkitBase}/accounts:signUp?key={Uri.EscapeDataString(endpoint.ApiKey)}";
         using var resp = await _http.PostAsJsonAsync(url, new { returnSecureToken = true }, ct).ConfigureAwait(false);
         var raw = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
         if (!resp.IsSuccessStatusCode)
@@ -105,13 +129,13 @@ public sealed class FirebaseAuthClient : IDisposable
         else
             TokenExpiresAtUtc = DateTime.UtcNow.AddMinutes(55);
 
-        PersistToConfig();
-        Plugin.Log.Info($"Firebase 匿名登入成功 uid={LocalId}");
+        PersistToConfig(endpoint);
+        Plugin.Log.Info($"{Label(endpoint)} 匿名登入成功 uid={LocalId}");
     }
 
-    private async Task RefreshAsyncInternal(CancellationToken ct)
+    private async Task RefreshAsyncInternal(BackendEndpoint endpoint, CancellationToken ct)
     {
-        var url = $"{FirebaseConfig.SecureTokenBase}/token?key={_apiKey}";
+        var url = $"{endpoint.SecureTokenBase}/token?key={Uri.EscapeDataString(endpoint.ApiKey)}";
         var form = new FormUrlEncodedContent(new[]
         {
             new System.Collections.Generic.KeyValuePair<string, string>("grant_type", "refresh_token"),
@@ -133,17 +157,14 @@ public sealed class FirebaseAuthClient : IDisposable
         else
             TokenExpiresAtUtc = DateTime.UtcNow.AddMinutes(55);
 
-        PersistToConfig();
-        Plugin.Log.Debug("Firebase token 已刷新");
+        PersistToConfig(endpoint);
+        Plugin.Log.Debug($"{Label(endpoint)} token 已刷新");
     }
 
-    private void PersistToConfig()
+    private void PersistToConfig(BackendEndpoint endpoint)
     {
         var cfg = Plugin.Config;
-        cfg.LastIdToken = IdToken;
-        cfg.LastRefreshToken = RefreshToken;
-        cfg.LastLocalId = LocalId;
-        cfg.LastTokenRefreshedAtUtc = DateTime.UtcNow;
+        cfg.SetCredentials(endpoint, IdToken, RefreshToken, LocalId, DateTime.UtcNow);
         cfg.Save();
     }
 

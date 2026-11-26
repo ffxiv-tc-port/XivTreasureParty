@@ -17,21 +17,23 @@ public sealed class FirebaseDatabaseClient
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
     };
 
-    private readonly string _dbUrl;
+    private readonly BackendSelector _backend;
     private readonly FirebaseAuthClient _auth;
     private readonly HttpClient _http = new();
 
-    public FirebaseDatabaseClient(string dbUrl, FirebaseAuthClient auth)
+    public FirebaseDatabaseClient(BackendSelector backend, FirebaseAuthClient auth)
     {
-        _dbUrl = dbUrl.TrimEnd('/');
+        _backend = backend;
         _auth = auth;
         _http.Timeout = TimeSpan.FromSeconds(20);
     }
 
+    /// <summary>網址與 token 取自同一個端點快照：token 只會送到簽發它的那個後端。</summary>
     private async Task<string> BuildUrlAsync(string path, CancellationToken ct)
     {
-        var token = await _auth.EnsureSignedInAsync(ct).ConfigureAwait(false);
-        return $"{_dbUrl}/{path.TrimStart('/')}.json?auth={Uri.EscapeDataString(token)}";
+        var endpoint = _backend.Current;
+        var token = await _auth.EnsureSignedInAsync(endpoint, ct).ConfigureAwait(false);
+        return $"{endpoint.DatabaseUrl}/{path.TrimStart('/')}.json?auth={Uri.EscapeDataString(token)}";
     }
 
     public async Task<T?> GetAsync<T>(string path, CancellationToken ct = default)

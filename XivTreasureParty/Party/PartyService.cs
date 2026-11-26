@@ -21,6 +21,7 @@ public sealed class PartyService
 
     private readonly FirebaseDatabaseClient _db;
     private readonly FirebaseAuthClient _auth;
+    private readonly BackendSelector _backend;
 
     public string? CurrentPartyCode { get; private set; }
     public string? CurrentUserId { get; private set; }
@@ -31,11 +32,17 @@ public sealed class PartyService
 
     public bool IsInParty => !string.IsNullOrEmpty(CurrentPartyCode);
 
-    public PartyService(FirebaseDatabaseClient db, FirebaseAuthClient auth)
+    /// <summary>目前後端的人數上限；null＝由伺服器決定（臨時伺服器）。</summary>
+    public int? MemberLimit => _backend.Current.Kind == BackendKind.Cycleapple ? MaxMembers : null;
+
+    public PartyService(FirebaseDatabaseClient db, FirebaseAuthClient auth, BackendSelector backend)
     {
         _db = db;
         _auth = auth;
+        _backend = backend;
     }
+
+    private BackendKind Kind => _backend.Current.Kind;
 
     public async Task<string> CreatePartyAsync(string? nickname = null)
     {
@@ -45,7 +52,7 @@ public sealed class PartyService
         string code = "";
         for (var attempt = 0; attempt < 10; attempt++)
         {
-            code = PartyCodeGenerator.Generate();
+            code = PartyCodeGenerator.Generate(PartyCodeGenerator.LengthFor(Kind));
             if (!await _db.ExistsAsync($"parties/{code}").ConfigureAwait(false)) break;
             code = "";
         }
@@ -92,8 +99,15 @@ public sealed class PartyService
     public async Task JoinPartyAsync(string partyCode, string? nickname = null)
     {
         partyCode = partyCode.Trim().ToUpperInvariant();
-        if (!PartyCodeGenerator.IsValidFormat(partyCode))
+        var kind = Kind;
+        if (!PartyCodeGenerator.IsValidFormat(partyCode, PartyCodeGenerator.LengthFor(kind)))
+        {
+            if (kind == BackendKind.Cycleapple && PartyCodeGenerator.IsValidFormat(partyCode, PartyCodeGenerator.CustomCodeLength))
+                throw new Exception("這是臨時伺服器的隊伍代碼（10 碼），請貼上完整的邀請網址，或先在「進階：臨時伺服器」切到自訂伺服器");
+            if (kind == BackendKind.Custom && PartyCodeGenerator.IsValidFormat(partyCode, PartyCodeGenerator.CodeLength))
+                throw new Exception("這是 cycleapple 的隊伍代碼（8 碼），目前連的是臨時伺服器；要回 cycleapple 請在「進階：臨時伺服器」切回");
             throw new Exception("隊伍代碼格式不正確");
+        }
 
         await _auth.EnsureSignedInAsync().ConfigureAwait(false);
         var uid = _auth.LocalId ?? throw new Exception("使用者未登入");
@@ -110,7 +124,7 @@ public sealed class PartyService
         }
 
         var memberCount = root.Members?.Count ?? 0;
-        if (memberCount >= MaxMembers && !(root.Members?.ContainsKey(uid) ?? false))
+        if (kind == BackendKind.Cycleapple && memberCount >= MaxMembers && !(root.Members?.ContainsKey(uid) ?? false))
             throw new Exception($"隊伍已滿 ({MaxMembers}/{MaxMembers})");
 
         Nickname = ResolveNickname(nickname, uid);
@@ -203,6 +217,15 @@ public sealed class PartyService
 
         Plugin.Log.Debug($"新增藏寶圖 key={key}");
         return key;
+    }
+
+    /// <summary>用 REST 讀目前隊伍未完成的藏寶圖（依順序）；不靠串流，串流連線已滿時也讀得到。</summary>
+    public async Task<List<Treasure>> GetPendingTreasuresAsync()
+    {
+        EnsureInParty();
+        var map = await _db.GetAsync<Dictionary<string, Treasure>>($"parties/{CurrentPartyCode}/treasures").ConfigureAwait(false);
+        if (map == null) return new List<Treasure>();
+        return map.Values.Where(t => !t.Completed).OrderBy(t => t.Order).ToList();
     }
 
     public async Task RemoveTreasureAsync(string firebaseKey)
@@ -317,7 +340,7 @@ public sealed class PartyService
         EnsureInParty();
         Nickname = newNickname;
         await _db.SetAsync($"parties/{CurrentPartyCode}/members/{CurrentUserId}/nickname", newNickname).ConfigureAwait(false);
-        Plugin.Config.Nickname = newNickname;
+        Plugin.Config.SetNickname(Kind, newNickname);
         Plugin.Config.Save();
     }
 
@@ -345,11 +368,15 @@ public sealed class PartyService
     public void SetOrderLocked(bool locked) => OrderLocked = locked;
     public void SetExpiresAt(long? expiresAt) => ExpiresAt = expiresAt;
 
-    private static string ResolveNickname(string? explicitName, string uid)
+    /// <summary>臨時伺服器不自動帶角色名（只用使用者自己填的，否則「玩家xxxx」）。</summary>
+    private string ResolveNickname(string? explicitName, string uid)
     {
         if (!string.IsNullOrWhiteSpace(explicitName)) return explicitName!;
-        var auto = XivTreasureParty.Game.PlayerInfo.GetAutoNickname();
-        if (!string.IsNullOrWhiteSpace(auto)) return auto!;
+        if (Kind == BackendKind.Cycleapple)
+        {
+            var auto = XivTreasureParty.Game.PlayerInfo.GetAutoNickname();
+            if (!string.IsNullOrWhiteSpace(auto)) return auto!;
+        }
         return $"玩家{uid[..Math.Min(4, uid.Length)]}";
     }
 
@@ -360,9 +387,9 @@ public sealed class PartyService
 
     private void PersistState()
     {
-        Plugin.Config.LastPartyCode = CurrentPartyCode;
+        Plugin.Config.SetLastPartyCode(Kind, CurrentPartyCode);
         if (!string.IsNullOrWhiteSpace(Nickname))
-            Plugin.Config.Nickname = Nickname!;
+            Plugin.Config.SetNickname(Kind, Nickname!);
         Plugin.Config.Save();
     }
 
@@ -373,7 +400,7 @@ public sealed class PartyService
         ExpiresAt = null;
         IsLeader = false;
         OrderLocked = false;
-        Plugin.Config.LastPartyCode = null;
+        Plugin.Config.SetLastPartyCode(Kind, null);
         Plugin.Config.Save();
     }
 }

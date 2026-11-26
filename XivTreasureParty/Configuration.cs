@@ -1,5 +1,6 @@
 using System;
 using Dalamud.Configuration;
+using XivTreasureParty.Firebase;
 
 namespace XivTreasureParty;
 
@@ -57,6 +58,78 @@ public class Configuration : IPluginConfiguration
     /// 關掉＝一律三條（舊行為）。下次建立／加入隊伍才生效。
     /// </summary>
     public bool SingleStreamSync { get; set; } = true;
+
+    // ── 臨時伺服器 ──
+    // 契約：上面的 LastPartyCode／Last*Token／LastLocalId／Nickname 就是 cycleapple 那一槽（既有使用者不搬資料）；
+    // 自訂後端只讀寫 Custom* 欄位，而且 CustomCredentialOwner 對不上目前端點時整組視為沒有。
+
+    public BackendKind Backend { get; set; } = BackendKind.Cycleapple;
+
+    public string CustomServerUrl { get; set; } = string.Empty;
+
+    public string CustomApiKey { get; set; } = string.Empty;
+
+    /// <summary>驗證服務與資料庫不在同一台時才填（例如 Firebase 模擬器）。</summary>
+    public string CustomAuthUrl { get; set; } = string.Empty;
+
+    public string? CustomLastPartyCode { get; set; }
+
+    /// <summary>自訂後端的暱稱；預設空白＝不帶角色名，用「玩家xxxx」。</summary>
+    public string CustomNickname { get; set; } = string.Empty;
+
+    public string? CustomIdToken { get; set; }
+
+    public string? CustomRefreshToken { get; set; }
+
+    public string? CustomLocalId { get; set; }
+
+    public DateTime? CustomTokenRefreshedAtUtc { get; set; }
+
+    /// <summary>Custom* 憑證屬於哪一個端點（<see cref="BackendEndpoint.SlotId"/>）。</summary>
+    public string? CustomCredentialOwner { get; set; }
+
+    public string? GetLastPartyCode(BackendKind kind) => kind == BackendKind.Custom ? CustomLastPartyCode : LastPartyCode;
+
+    public void SetLastPartyCode(BackendKind kind, string? code)
+    {
+        if (kind == BackendKind.Custom) CustomLastPartyCode = code;
+        else LastPartyCode = code;
+    }
+
+    public string GetNickname(BackendKind kind) => kind == BackendKind.Custom ? CustomNickname : Nickname;
+
+    public void SetNickname(BackendKind kind, string nickname)
+    {
+        if (kind == BackendKind.Custom) CustomNickname = nickname;
+        else Nickname = nickname;
+    }
+
+    /// <summary>讀出 <paramref name="endpoint"/> 那一槽的憑證；槽的主人對不上時回全空。</summary>
+    public (string? IdToken, string? RefreshToken, string? LocalId, DateTime? RefreshedAtUtc) GetCredentials(BackendEndpoint endpoint)
+    {
+        if (endpoint.Kind == BackendKind.Cycleapple)
+            return (LastIdToken, LastRefreshToken, LastLocalId, LastTokenRefreshedAtUtc);
+        if (CustomCredentialOwner != endpoint.SlotId)
+            return (null, null, null, null);
+        return (CustomIdToken, CustomRefreshToken, CustomLocalId, CustomTokenRefreshedAtUtc);
+    }
+
+    public void SetCredentials(BackendEndpoint endpoint, string? idToken, string? refreshToken, string? localId, DateTime refreshedAtUtc)
+    {
+        if (endpoint.Kind == BackendKind.Cycleapple)
+        {
+            LastIdToken = idToken;
+            LastRefreshToken = refreshToken;
+            LastLocalId = localId;
+            LastTokenRefreshedAtUtc = refreshedAtUtc;
+            return;
+        }
+        CustomCredentialOwner = endpoint.SlotId;
+        CustomIdToken = idToken;
+        CustomRefreshToken = refreshToken;
+        CustomLocalId = localId;
+        CustomTokenRefreshedAtUtc = refreshedAtUtc;
+    }
 
     public void Save() => Plugin.PluginInterface.SavePluginConfig(this);
 }

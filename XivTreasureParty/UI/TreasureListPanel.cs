@@ -333,7 +333,7 @@ public sealed class TreasureListPanel
         Plugin.Config.Save();
     }
 
-    private static string NormalizeChatCommand(string? command)
+    internal static string NormalizeChatCommand(string? command)
     {
         command = command?.Trim();
         if (string.IsNullOrEmpty(command))

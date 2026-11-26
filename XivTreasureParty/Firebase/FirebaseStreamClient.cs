@@ -94,7 +94,7 @@ public sealed class StreamCancelledException : FirebaseException
 /// </summary>
 public sealed class FirebaseStreamClient : IDisposable
 {
-    private readonly string _dbUrl;
+    private readonly Func<string> _dbUrl;
     private readonly FirebaseAuthClient _auth;
     private readonly ConcurrentDictionary<Guid, StreamSubscription> _subscriptions = new();
 
@@ -102,8 +102,15 @@ public sealed class FirebaseStreamClient : IDisposable
     private readonly ConcurrentDictionary<string, byte> _loggedResponses = new();
 
     public FirebaseStreamClient(string dbUrl, FirebaseAuthClient auth)
+        : this(() => dbUrl, auth)
     {
-        _dbUrl = dbUrl.TrimEnd('/');
+    }
+
+    /// <param name="dbUrl">每次連線時讀一次目前的資料庫網址（切換後端不必重建這個物件）。</param>
+    /// <param name="auth">取 token 用；必須與 <paramref name="dbUrl"/> 看同一個目前端點。</param>
+    public FirebaseStreamClient(Func<string> dbUrl, FirebaseAuthClient auth)
+    {
+        _dbUrl = dbUrl;
         _auth = auth;
     }
 
@@ -139,12 +146,12 @@ public sealed class FirebaseStreamClient : IDisposable
         _subscriptions.Clear();
     }
 
-    internal string BuildUrlWithoutToken(string path) => $"{_dbUrl}/{path.TrimStart('/')}.json";
+    internal string BuildUrlWithoutToken(string dbUrl, string path) => $"{dbUrl}/{path.TrimStart('/')}.json";
 
     internal FirebaseAuthClient Auth => _auth;
 
     /// <summary>目前串流連的資料庫網址（不含憑證）。</summary>
-    public string DatabaseUrl => _dbUrl;
+    public string DatabaseUrl => _dbUrl().TrimEnd('/');
 
     /// <summary>伺服器錯誤回應寫成 Information，同一種（狀態碼＋內容）整個插件生命期只記一次。不記網址（帶 ?auth=）。</summary>
     internal void LogServerResponseOnce(string path, StreamHttpException ex)
@@ -424,8 +431,12 @@ public sealed class FirebaseStreamClient : IDisposable
 
         private async Task StreamOnceAsync(CancellationToken ct)
         {
+            var dbUrl = _owner.DatabaseUrl;
             var token = await _owner.Auth.EnsureSignedInAsync(ct).ConfigureAwait(false);
-            var url = _owner.BuildUrlWithoutToken(_path) + $"?auth={Uri.EscapeDataString(token)}";
+            // 取 token 期間後端被換掉＝這顆 token 與網址不屬於同一個伺服器，不送。
+            if (_owner.DatabaseUrl != dbUrl)
+                throw new FirebaseException("同步伺服器已切換，放棄這次連線");
+            var url = _owner.BuildUrlWithoutToken(dbUrl, _path) + $"?auth={Uri.EscapeDataString(token)}";
 
             using var http = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
             http.DefaultRequestHeaders.Accept.Clear();

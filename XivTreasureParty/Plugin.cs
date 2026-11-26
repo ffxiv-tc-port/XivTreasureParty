@@ -30,6 +30,9 @@ public sealed class Plugin : IDalamudPlugin
 
     public static Configuration Config { get; private set; } = null!;
 
+    /// <summary>目前的同步端點；切換只換它裡面的端點，下面的服務物件永遠不重建。</summary>
+    public static BackendSelector Backend { get; private set; } = null!;
+
     public static FirebaseAuthClient FirebaseAuth { get; private set; } = null!;
     public static FirebaseDatabaseClient FirebaseDb { get; private set; } = null!;
     public static FirebaseStreamClient FirebaseStream { get; private set; } = null!;
@@ -70,11 +73,22 @@ public sealed class Plugin : IDalamudPlugin
 
         Config = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
 
-        FirebaseAuth = new FirebaseAuthClient(FirebaseConfig.ApiKey);
-        FirebaseDb = new FirebaseDatabaseClient(FirebaseConfig.DatabaseUrl, FirebaseAuth);
-        FirebaseStream = new FirebaseStreamClient(FirebaseConfig.DatabaseUrl, FirebaseAuth);
+        string? backendError = null;
+        var initial = BackendEndpoint.Cycleapple;
+        if (Config.Backend == BackendKind.Custom)
+        {
+            initial = BackendEndpoint.TryCreateCustom(Config.CustomServerUrl, Config.CustomApiKey, Config.CustomAuthUrl, out var err)
+                      ?? BackendEndpoint.Cycleapple;
+            if (initial.Kind != BackendKind.Custom)
+                backendError = $"設定選的是臨時伺服器，但網址不能用（{err}），這次先用 cycleapple；請到「進階：臨時伺服器」修正";
+        }
+        Backend = new BackendSelector(initial);
 
-        PartyService = new PartyService(FirebaseDb, FirebaseAuth);
+        FirebaseAuth = new FirebaseAuthClient(Backend);
+        FirebaseDb = new FirebaseDatabaseClient(Backend, FirebaseAuth);
+        FirebaseStream = new FirebaseStreamClient(() => Backend.Current.DatabaseUrl, FirebaseAuth);
+
+        PartyService = new PartyService(FirebaseDb, FirebaseAuth, Backend);
         SyncService = new SyncService(FirebaseStream);
         Heartbeat = new HeartbeatService(FirebaseDb, PartyService, FirebaseAuth);
         ChatSender = new ChatSender();
@@ -94,7 +108,12 @@ public sealed class Plugin : IDalamudPlugin
         });
 
         // 載入時不碰網路：登入延到建立／加入隊伍那一刻（FirebaseDatabaseClient 每次請求前自己確保登入）。
-        if (Config.AutoRejoinOnStart && !string.IsNullOrWhiteSpace(Config.LastPartyCode))
+        if (backendError != null)
+        {
+            AutoRejoinError = backendError;
+            Log.Warning(backendError);
+        }
+        else if (Config.AutoRejoinOnStart && !string.IsNullOrWhiteSpace(Config.GetLastPartyCode(Backend.Current.Kind)))
         {
             AutoRejoinInProgress = true;
             _ = System.Threading.Tasks.Task.Run(AutoRejoinAsync);
@@ -128,6 +147,28 @@ public sealed class Plugin : IDalamudPlugin
     }
 
     /// <summary>開串流與心跳，兩者同在一次閘門內（要嘛都開、要嘛都不開）；卸載中回 false。</summary>
+    /// <summary>
+    /// 換同步後端。只有沒在隊伍裡、沒在自動重新加入、沒有任何串流訂閱時才換，
+    /// 所以不會同時連兩邊，也不會有請求拿 A 的憑證打 B。
+    /// </summary>
+    internal static bool TrySwitchBackend(BackendEndpoint endpoint, out string reason)
+    {
+        lock (StartGate)
+        {
+            if (_unloading) { reason = "插件正在卸載"; return false; }
+            if (PartyService.IsInParty) { reason = "先離開隊伍才能切換"; return false; }
+            if (AutoRejoinInProgress) { reason = "正在自動重新加入上次的隊伍，請稍候"; return false; }
+            if (SyncService.HasSubscriptions || FirebaseStream.ActiveSubscriptions.Count > 0) { reason = "同步連線還沒關閉，請稍候再試"; return false; }
+            if (Backend.Current.SlotId != endpoint.SlotId)
+            {
+                Backend.Set(endpoint);
+                Log.Information(endpoint.Kind == BackendKind.Custom ? "同步後端已切換到臨時伺服器" : "同步後端已切換回 cycleapple");
+            }
+            reason = string.Empty;
+            return true;
+        }
+    }
+
     internal static bool TryStartSession(string partyCode) =>
         RunIfNotUnloading(() =>
         {
@@ -139,12 +180,14 @@ public sealed class Plugin : IDalamudPlugin
     {
         try
         {
-            var lastCode = Config.LastPartyCode;
+            var kind = Backend.Current.Kind;
+            var lastCode = Config.GetLastPartyCode(kind);
             if (!string.IsNullOrWhiteSpace(lastCode))
             {
                 try
                 {
-                    await PartyService.TryRejoinAsync(lastCode, Config.Nickname).ConfigureAwait(false);
+                    var nickname = Config.GetNickname(kind);
+                    await PartyService.TryRejoinAsync(lastCode, string.IsNullOrWhiteSpace(nickname) ? null : nickname).ConfigureAwait(false);
                     // 等回應期間插件已卸載：不再開串流與心跳，否則重連迴圈會在卸載後繼續跑。
                     if (!TryStartSession(PartyService.CurrentPartyCode!)) return;
                     AutoRejoinError = null;
@@ -154,9 +197,9 @@ public sealed class Plugin : IDalamudPlugin
                 {
                     AutoRejoinError = $"自動重新加入隊伍 {lastCode} 失敗：{ex.Message}";
                     // 只在設定檔仍記著這一隊時才清：等待回應期間使用者手動加入的新隊伍不能被一起忘掉。
-                    if (Config.LastPartyCode == lastCode)
+                    if (Config.GetLastPartyCode(kind) == lastCode)
                     {
-                        Config.LastPartyCode = null;
+                        Config.SetLastPartyCode(kind, null);
                         Config.Save();
                         Log.Info($"自動重新加入隊伍 {lastCode} 失敗：{ex.Message}；已清除記住的隊伍代碼，之後啟動不再重試");
                     }
