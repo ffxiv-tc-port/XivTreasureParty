@@ -116,14 +116,15 @@ public sealed class SyncService
     }
 
     /// <summary>
-    /// 單條串流的錯誤回呼（在該串流的背景執行緒上）。規則不准讀整個隊伍節點時改開三條；
+    /// 單條串流的錯誤回呼（在該串流的背景執行緒上）。被拒讀（cancel、任何 401／403）時改開三條；
     /// 其他錯誤（含 402 連線已滿）交給串流自己的退避重連，不切換。
     /// </summary>
+    /// <remarks>刻意不只認「Permission denied」字樣：正式伺服器拒讀的回應內容沒有證據，認錯就會整個隊伍永遠連不上；誤退三條只是少省連線。</remarks>
     private void OnSingleStreamError(Exception ex, string partyCode, int generation)
     {
         try { SyncError?.Invoke(ex); } catch { }
 
-        var denied = ex is StreamCancelledException || ex is StreamHttpException { IsPermissionDenied: true };
+        var denied = ex is StreamCancelledException || ex is StreamHttpException { StatusCode: 401 or 403 };
         if (!denied) return;
 
         Plugin.RunIfNotUnloading(() =>
