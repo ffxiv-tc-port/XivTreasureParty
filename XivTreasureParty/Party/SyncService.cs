@@ -8,22 +8,35 @@ using XivTreasureParty.Party.Models;
 namespace XivTreasureParty.Party;
 
 /// <summary>
-/// 對應網頁版 sync-service.js — 透過 Firebase SSE 同時監聽 members / treasures / meta。
-/// 收到事件後解析 path 區分增刪改，更新本地 snapshot，最後觸發 UI 回調。
+/// 對應網頁版 sync-service.js — 透過 Firebase SSE 監聽隊伍的 members / treasures / meta。
+/// 預設只開一條訂閱整個 <c>parties/{code}</c>，依事件 path 分給三個處理器；
+/// 伺服器不准讀整個隊伍節點時，自動改回三條各訂一個子節點（舊作法，網頁版也是分三個監聽）。
 /// </summary>
 /// <remarks>
 /// 執行緒契約：<see cref="Members"/>／<see cref="Treasures"/> 是「發佈後結構不再改」的快照，
 /// 任何執行緒都可以無鎖直接讀；寫入端一律在 <c>_writeLock</c> 內複製副本、改完再整體換引用。
+/// 訂閱欄位只在 <c>_subLock</c> 內改；鎖的順序固定是 Plugin 的 StartGate → <c>_subLock</c>。
 /// </remarks>
 public sealed class SyncService
 {
+    private static readonly string[] ChildNodes = { "members", "treasures", "meta" };
+
     private readonly FirebaseStreamClient _stream;
+    private readonly Func<bool> _preferSingleStream;
 
-    private FirebaseStreamClient.StreamSubscription? _membersSub;
-    private FirebaseStreamClient.StreamSubscription? _treasuresSub;
-    private FirebaseStreamClient.StreamSubscription? _metaSub;
+    private readonly object _subLock = new();
+    private volatile FirebaseStreamClient.StreamSubscription? _partySub;
+    private volatile FirebaseStreamClient.StreamSubscription? _membersSub;
+    private volatile FirebaseStreamClient.StreamSubscription? _treasuresSub;
+    private volatile FirebaseStreamClient.StreamSubscription? _metaSub;
 
-    private string? _currentCode;
+    /// <summary>每次 Start／Stop 加一；退回三條的回呼對不上目前世代就作廢（那條訂閱早就被換掉了）。</summary>
+    private int _generation;
+
+    /// <summary>單條被拒過的資料庫網址：同一個伺服器之後直接開三條，不再每次先被拒一次。</summary>
+    private readonly HashSet<string> _singleDeniedDatabases = new(StringComparer.OrdinalIgnoreCase);
+
+    private volatile string? _currentCode;
 
     private DateTime _lastManualReconnectUtc = DateTime.MinValue;
 
@@ -47,19 +60,45 @@ public sealed class SyncService
     public event Action? MetaChanged;
     public event Action<Exception>? SyncError;
 
-    public SyncService(FirebaseStreamClient stream)
+    /// <param name="stream">串流用戶端。</param>
+    /// <param name="preferSingleStream">每次 Start 時讀一次；null＝讀設定 <c>SingleStreamSync</c>。</param>
+    public SyncService(FirebaseStreamClient stream, Func<bool>? preferSingleStream = null)
     {
         _stream = stream;
+        _preferSingleStream = preferSingleStream ?? (() => Plugin.Config.SingleStreamSync);
     }
 
-    /// <summary>重建三條串流；插件已開始卸載時什麼都不開並回 false。</summary>
+    /// <summary>重建串流；插件已開始卸載時什麼都不開並回 false。</summary>
     public bool Start(string partyCode) => Plugin.RunIfNotUnloading(() => StartCore(partyCode));
 
     private void StartCore(string partyCode)
     {
         Stop();
-        _currentCode = partyCode;
+        lock (_subLock)
+        {
+            _currentCode = partyCode;
+            var generation = _generation;
+            bool single;
+            lock (_singleDeniedDatabases)
+                single = _preferSingleStream() && !_singleDeniedDatabases.Contains(_stream.DatabaseUrl);
 
+            if (single)
+                SubscribeSingle(partyCode, generation);
+            else
+                SubscribeTriple(partyCode);
+        }
+    }
+
+    private void SubscribeSingle(string partyCode, int generation)
+    {
+        _partySub = _stream.Subscribe(
+            $"parties/{partyCode}",
+            ev => RunSafeOnFrameworkThread(() => ApplyPartyEvent(ev), "party"),
+            ex => OnSingleStreamError(ex, partyCode, generation));
+    }
+
+    private void SubscribeTriple(string partyCode)
+    {
         _membersSub = _stream.Subscribe(
             $"parties/{partyCode}/members",
             ev => RunSafeOnFrameworkThread(() => ApplyMembers(ev), "members"),
@@ -74,6 +113,32 @@ public sealed class SyncService
             $"parties/{partyCode}/meta",
             ev => RunSafeOnFrameworkThread(() => HandleMeta(ev), "meta"),
             ex => SyncError?.Invoke(ex));
+    }
+
+    /// <summary>
+    /// 單條串流的錯誤回呼（在該串流的背景執行緒上）。規則不准讀整個隊伍節點時改開三條；
+    /// 其他錯誤（含 402 連線已滿）交給串流自己的退避重連，不切換。
+    /// </summary>
+    private void OnSingleStreamError(Exception ex, string partyCode, int generation)
+    {
+        try { SyncError?.Invoke(ex); } catch { }
+
+        var denied = ex is StreamCancelledException || ex is StreamHttpException { IsPermissionDenied: true };
+        if (!denied) return;
+
+        Plugin.RunIfNotUnloading(() =>
+        {
+            lock (_subLock)
+            {
+                if (generation != _generation || _partySub == null) return;
+
+                lock (_singleDeniedDatabases) _singleDeniedDatabases.Add(_stream.DatabaseUrl);
+                _partySub.Dispose();
+                _partySub = null;
+                Plugin.Log.Information($"[Sync] 伺服器不准用一條連線讀整個隊伍（{ex.Message}），改回成員／藏寶圖／隊伍設定三條連線（隊伍 {partyCode}）");
+                SubscribeTriple(partyCode);
+            }
+        });
     }
 
     private static void RunSafeOnFrameworkThread(Action action, string scope)
@@ -100,9 +165,15 @@ public sealed class SyncService
     /// <summary>離開／切換隊伍。呼叫端多半在執行緒池上（UI 按鈕都包在 Task.Run 裡）。</summary>
     public void Stop()
     {
-        _membersSub?.Dispose(); _membersSub = null;
-        _treasuresSub?.Dispose(); _treasuresSub = null;
-        _metaSub?.Dispose(); _metaSub = null;
+        lock (_subLock)
+        {
+            _generation++;
+            _partySub?.Dispose(); _partySub = null;
+            _membersSub?.Dispose(); _membersSub = null;
+            _treasuresSub?.Dispose(); _treasuresSub = null;
+            _metaSub?.Dispose(); _metaSub = null;
+            _currentCode = null;
+        }
 
         lock (_writeLock)
         {
@@ -111,19 +182,27 @@ public sealed class SyncService
         }
 
         Meta = null;
-        _currentCode = null;
     }
 
     /// <summary>目前訂閱中的隊伍代碼（沒訂閱時為 null）。</summary>
     public string? CurrentCode => _currentCode;
 
+    /// <summary>目前是合併的單條串流（false＝三條或沒有訂閱）。</summary>
+    public bool IsSingleStream => _partySub != null;
+
+    /// <summary>還有任何訂閱存在（含退避中的）。</summary>
+    public bool HasSubscriptions => _partySub != null || _membersSub != null || _treasuresSub != null || _metaSub != null;
+
     /// <summary>
-    /// 把三條串流的狀態聚合成一列給 UI 用。在繪製執行緒呼叫；
+    /// 把目前的串流狀態聚合成一列給 UI 用。在繪製執行緒呼叫；
     /// 每條串流的狀態都是背景執行緒整體指派的不可變快照，讀到的一定是完整的一份。
     /// </summary>
     public SyncConnectionInfo GetConnectionInfo()
     {
-        var subs = new[] { _membersSub, _treasuresSub, _metaSub };
+        var party = _partySub;
+        var subs = party != null
+            ? new[] { party }
+            : new[] { _membersSub, _treasuresSub, _metaSub };
         var info = new SyncConnectionInfo { Total = 0, Connected = 0, State = StreamConnectionState.Idle };
 
         var anyStopped = false;
@@ -153,7 +232,10 @@ public sealed class SyncService
                 info.LastEventUtc = le;
 
             if (info.LastError == null && st.State != StreamConnectionState.Connected)
+            {
                 info.LastError = st.LastError;
+                info.LastStatusCode = st.LastStatusCode;
+            }
         }
 
         if (info.Total == 0)
@@ -169,11 +251,12 @@ public sealed class SyncService
         else
             info.State = StreamConnectionState.Idle;
 
+        info.Single = party != null;
         return info;
     }
 
     /// <summary>
-    /// 手動重新連線：三條串流各插隊一次立刻重試（不等退避）。
+    /// 手動重新連線：每條串流各插隊一次立刻重試（不等退避）。
     /// 訂閱整個不見時（例如重連迴圈曾經停掉、或啟動時沒接上）則重新建立訂閱。
     /// 自帶 3 秒節流，避免使用者連點變成每幀重試。
     /// </summary>
@@ -190,17 +273,90 @@ public sealed class SyncService
             return false;
         }
 
-        if (_membersSub == null || _treasuresSub == null || _metaSub == null)
+        FirebaseStreamClient.StreamSubscription?[] subs;
+        lock (_subLock)
         {
-            Plugin.Log.Information($"[Sync] 手動重新連線：訂閱不存在，重新建立三條串流（隊伍 {code}）。");
+            subs = _partySub != null
+                ? new[] { _partySub }
+                : new[] { _membersSub, _treasuresSub, _metaSub };
+        }
+
+        if (Array.Exists(subs, s => s == null))
+        {
+            Plugin.Log.Information($"[Sync] 手動重新連線：訂閱不存在，重新建立串流（隊伍 {code}）。");
             return Start(code!);
         }
 
-        Plugin.Log.Information($"[Sync] 手動重新連線：要求三條串流立刻重試（隊伍 {code}）。");
-        _membersSub.RequestImmediateRetry();
-        _treasuresSub.RequestImmediateRetry();
-        _metaSub.RequestImmediateRetry();
+        Plugin.Log.Information($"[Sync] 手動重新連線：要求 {subs.Length} 條串流立刻重試（隊伍 {code}）。");
+        foreach (var sub in subs) sub!.RequestImmediateRetry();
         return true;
+    }
+
+    /// <summary>
+    /// 單條串流的事件（path 相對於 <c>parties/{code}</c>）改寫成三條子串流各自會收到的形狀，再交給原本的處理器。
+    /// 只在 framework 執行緒上執行。
+    /// </summary>
+    private void ApplyPartyEvent(StreamEvent ev)
+    {
+        if (ev.Path == "/")
+        {
+            using var doc = JsonDocument.Parse(ev.DataJson);
+            var root = doc.RootElement;
+
+            if (ev.Type == StreamEventType.Put)
+            {
+                // 整個隊伍節點的快照（或 null＝隊伍被刪）：三個子節點各收一次 put "/"，缺的就是 null。
+                foreach (var child in ChildNodes)
+                {
+                    var data = root.ValueKind == JsonValueKind.Object && root.TryGetProperty(child, out var v)
+                        ? v.GetRawText()
+                        : "null";
+                    DispatchChild(child, StreamEventType.Put, "/", data);
+                }
+                return;
+            }
+
+            // 隊伍層的多路徑更新：每個鍵各自拆成對應子節點的 put。
+            if (root.ValueKind != JsonValueKind.Object) return;
+            foreach (var prop in root.EnumerateObject())
+            {
+                var (child, rest) = SplitChild(prop.Name);
+                DispatchChild(child, StreamEventType.Put, rest, prop.Value.GetRawText());
+            }
+            return;
+        }
+
+        var (c, r) = SplitChild(ev.Path);
+        DispatchChild(c, ev.Type, r, ev.DataJson);
+    }
+
+    /// <summary>"/treasures/k1/order" → ("treasures", "/k1/order")；"/members" → ("members", "/")。</summary>
+    private static (string Child, string Tail) SplitChild(string path)
+    {
+        var trimmed = path.Trim('/');
+        var slash = trimmed.IndexOf('/');
+        return slash < 0 ? (trimmed, "/") : (trimmed[..slash], "/" + trimmed[(slash + 1)..]);
+    }
+
+    private void DispatchChild(string child, StreamEventType type, string path, string dataJson)
+    {
+        var ev = new StreamEvent { Type = type, Path = path, DataJson = dataJson };
+        try
+        {
+            switch (child)
+            {
+                case "members": ApplyMembers(ev); break;
+                case "treasures": ApplyTreasures(ev); break;
+                case "meta": HandleMeta(ev); break;
+                default:
+                    Plugin.Log.Debug($"[Sync] 略過隊伍節點下未知的子節點：{child}");
+                    break;
+            }
+        }
+        catch (Exception ex)
+        {
+            Plugin.Log.Error(ex, $"[Sync:{child}] 處理事件時例外");
+        }
     }
 
     /// <summary>
@@ -477,12 +633,12 @@ public sealed class SyncService
     }
 }
 
-/// <summary>三條串流聚合後的連線狀態，只給 UI 顯示用。</summary>
+/// <summary>串流（一條或三條）聚合後的連線狀態，只給 UI 顯示用。</summary>
 public sealed class SyncConnectionInfo
 {
     public StreamConnectionState State { get; set; } = StreamConnectionState.Idle;
 
-    /// <summary>三條串流裡最高的連續失敗次數。</summary>
+    /// <summary>各條串流裡最高的連續失敗次數。</summary>
     public int FailedAttempts { get; set; }
 
     /// <summary>最快的一條下次重試的時刻。</summary>
@@ -492,6 +648,12 @@ public sealed class SyncConnectionInfo
     public DateTime? LastEventUtc { get; set; }
 
     public string? LastError { get; set; }
+
+    /// <summary>最後一次失敗的 HTTP 狀態碼（例如 402）；不是 HTTP 錯誤時為 null。</summary>
+    public int? LastStatusCode { get; set; }
+
+    /// <summary>目前是合併的單條串流。</summary>
+    public bool Single { get; set; }
 
     /// <summary>目前有幾條串流。</summary>
     public int Total { get; set; }

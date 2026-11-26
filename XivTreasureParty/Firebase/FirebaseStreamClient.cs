@@ -45,12 +45,46 @@ public sealed class StreamStatus
     public DateTime? ConnectedSinceUtc { get; init; }
 
     public string? LastError { get; init; }
+
+    /// <summary>最後一次失敗時伺服器回的 HTTP 狀態碼；不是 HTTP 錯誤（逾時、斷線）或已連上時為 null。</summary>
+    public int? LastStatusCode { get; init; }
 }
 
 /// <summary>Firebase 回報登入憑證已失效（auth_revoked）。要重新取得憑證才能重連。</summary>
 public sealed class FirebaseAuthRevokedException : FirebaseException
 {
     public FirebaseAuthRevokedException(string message) : base(message) { }
+}
+
+/// <summary>串流請求被伺服器以非 2xx 拒絕；<see cref="Body"/> 已截短並遮掉憑證。</summary>
+public sealed class StreamHttpException : FirebaseException
+{
+    public int StatusCode { get; }
+    public string Body { get; }
+
+    public StreamHttpException(int statusCode, string reason, string body)
+        : base(body.Length == 0 ? $"HTTP {statusCode} ({reason})" : $"HTTP {statusCode} ({reason}): {Shorten(body, 120)}")
+    {
+        StatusCode = statusCode;
+        Body = body;
+    }
+
+    /// <summary>規則不准讀這個位置（Firebase 回 401／403 並帶「Permission denied」）。</summary>
+    public bool IsPermissionDenied =>
+        StatusCode is 401 or 403 && Body.Contains("Permission denied", StringComparison.OrdinalIgnoreCase);
+
+    internal static string Shorten(string s, int max)
+    {
+        s = s.Replace("\r", " ").Replace("\n", " ").Trim();
+        while (s.Contains("  ")) s = s.Replace("  ", " ");
+        return s.Length <= max ? s : s[..max] + "…";
+    }
+}
+
+/// <summary>伺服器送了 cancel 事件：規則改成不准再讀這個位置。</summary>
+public sealed class StreamCancelledException : FirebaseException
+{
+    public StreamCancelledException(string message) : base(message) { }
 }
 
 /// <summary>
@@ -63,6 +97,9 @@ public sealed class FirebaseStreamClient : IDisposable
     private readonly string _dbUrl;
     private readonly FirebaseAuthClient _auth;
     private readonly ConcurrentDictionary<Guid, StreamSubscription> _subscriptions = new();
+
+    /// <summary>已經記過 log 的伺服器錯誤回應（狀態碼＋內容）；同一種只記第一次。</summary>
+    private readonly ConcurrentDictionary<string, byte> _loggedResponses = new();
 
     public FirebaseStreamClient(string dbUrl, FirebaseAuthClient auth)
     {
@@ -105,6 +142,16 @@ public sealed class FirebaseStreamClient : IDisposable
     internal string BuildUrlWithoutToken(string path) => $"{_dbUrl}/{path.TrimStart('/')}.json";
 
     internal FirebaseAuthClient Auth => _auth;
+
+    /// <summary>目前串流連的資料庫網址（不含憑證）。</summary>
+    public string DatabaseUrl => _dbUrl;
+
+    /// <summary>伺服器錯誤回應寫成 Information，同一種（狀態碼＋內容）整個插件生命期只記一次。不記網址（帶 ?auth=）。</summary>
+    internal void LogServerResponseOnce(string path, StreamHttpException ex)
+    {
+        if (!_loggedResponses.TryAdd($"{ex.StatusCode}|{ex.Body}", 0)) return;
+        Plugin.Log.Information($"[Stream {path}] 伺服器回應 HTTP {ex.StatusCode}，內容：{(ex.Body.Length == 0 ? "（空白）" : StreamHttpException.Shorten(ex.Body, 500))}（同一種回應只記這一次）");
+    }
 
     public sealed class StreamSubscription : IDisposable
     {
@@ -214,7 +261,8 @@ public sealed class FirebaseStreamClient : IDisposable
             return cts;
         }
 
-        private void Publish(StreamConnectionState state, int failedAttempts, DateTime? nextRetryUtc, string? lastError)
+        private void Publish(StreamConnectionState state, int failedAttempts, DateTime? nextRetryUtc, string? lastError,
+                             int? lastStatusCode = null)
         {
             var lastEvent = Interlocked.Read(ref _lastEventTicks);
             var connectedSince = Interlocked.Read(ref _connectedSinceTicks);
@@ -225,7 +273,8 @@ public sealed class FirebaseStreamClient : IDisposable
                 NextRetryUtc = nextRetryUtc,
                 LastEventUtc = lastEvent == 0 ? null : new DateTime(lastEvent, DateTimeKind.Utc),
                 ConnectedSinceUtc = connectedSince == 0 ? null : new DateTime(connectedSince, DateTimeKind.Utc),
-                LastError = lastError
+                LastError = lastError,
+                LastStatusCode = lastStatusCode
             };
         }
 
@@ -243,7 +292,7 @@ public sealed class FirebaseStreamClient : IDisposable
                     var authRevoked = false;
                     var manualInterrupt = false;
 
-                    Publish(StreamConnectionState.Connecting, failedAttempts, null, _status.LastError);
+                    Publish(StreamConnectionState.Connecting, failedAttempts, null, _status.LastError, _status.LastStatusCode);
 
                     try
                     {
@@ -336,7 +385,8 @@ public sealed class FirebaseStreamClient : IDisposable
                     }
 
                     Publish(StreamConnectionState.Reconnecting, failedAttempts,
-                            DateTime.UtcNow.AddMilliseconds(delayMs), failure?.Message);
+                            DateTime.UtcNow.AddMilliseconds(delayMs), failure?.Message,
+                            (failure as StreamHttpException)?.StatusCode);
 
                     var delayCts = NewAttemptScope(ct);
                     try
@@ -396,7 +446,7 @@ public sealed class FirebaseStreamClient : IDisposable
                     var resp2 = await SendWithConnectTimeoutAsync(http, req2, connectCts, ct).ConfigureAwait(false);
                     try
                     {
-                        resp2.EnsureSuccessStatusCode();
+                        await ThrowIfFailedAsync(resp2, token, connectCts.Token).ConfigureAwait(false);
                         connectCts.CancelAfter(Timeout.Infinite);
                         await ReadEventsAsync(resp2, ct).ConfigureAwait(false);
                     }
@@ -404,13 +454,39 @@ public sealed class FirebaseStreamClient : IDisposable
                     return;
                 }
 
-                resp.EnsureSuccessStatusCode();
+                await ThrowIfFailedAsync(resp, token, connectCts.Token).ConfigureAwait(false);
                 // header 已到手，解除連線逾時計時器，接下來交給讀取停滯看門狗。
                 connectCts.CancelAfter(Timeout.Infinite);
                 await ReadEventsAsync(resp, ct).ConfigureAwait(false);
             }
             finally { resp.Dispose(); }
         }
+
+        /// <summary>非 2xx：讀回應內容（上限 2 KB、遮掉憑證）、記一次 log，擲 <see cref="StreamHttpException"/>。</summary>
+        private async Task ThrowIfFailedAsync(HttpResponseMessage resp, string token, CancellationToken ct)
+        {
+            if (resp.IsSuccessStatusCode) return;
+
+            var body = string.Empty;
+            try
+            {
+                var raw = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+                body = raw.Length > 2048 ? raw[..2048] : raw;
+                if (token.Length > 0) body = body.Replace(token, "***");
+                body = AuthQueryPattern.Replace(body, "auth=***");
+            }
+            catch (Exception) when (!ct.IsCancellationRequested)
+            {
+                // 內容讀不到也照樣以狀態碼回報。
+            }
+
+            var ex = new StreamHttpException((int)resp.StatusCode, resp.ReasonPhrase ?? resp.StatusCode.ToString(), body);
+            _owner.LogServerResponseOnce(_path, ex);
+            throw ex;
+        }
+
+        private static readonly System.Text.RegularExpressions.Regex AuthQueryPattern =
+            new(@"auth=[^&\s""]+", System.Text.RegularExpressions.RegexOptions.CultureInvariant);
 
         private static async Task<HttpResponseMessage> SendWithConnectTimeoutAsync(
             HttpClient http, HttpRequestMessage req, CancellationTokenSource connectCts, CancellationToken ct)
@@ -526,7 +602,7 @@ public sealed class FirebaseStreamClient : IDisposable
                 // 下面兩個一定要擲得出去，讓 RunAsync 接到並重連。
                 // 不可以把 throw 包進自己的 try/catch：例外離不開這個方法時「憑證失效」只會留下一行 Error，不會重連。
                 case "cancel":
-                    throw new FirebaseException("Firebase 伺服器主動取消串流: " + data);
+                    throw new StreamCancelledException("Firebase 伺服器主動取消串流: " + data);
                 case "auth_revoked":
                     throw new FirebaseAuthRevokedException("Firebase 回報登入憑證已失效 (auth_revoked)");
                 default:

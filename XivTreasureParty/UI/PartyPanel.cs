@@ -140,6 +140,8 @@ public sealed class PartyPanel
                     ? Math.Max(0, (int)Math.Ceiling((next - DateTime.UtcNow).TotalSeconds))
                     : -1;
                 var when = seconds >= 0 ? $"{seconds} 秒後" : "時間未知";
+                if (info.LastStatusCode == 402)
+                    return ($"同步伺服器連線已滿，{when}重試", orange);
                 // 失敗次數為 0 ＝ 伺服器把上一條串流正常關掉，只是接回去，不是出錯。
                 return info.FailedAttempts > 0
                     ? ($"重連中 第 {info.FailedAttempts} 次，{when}", orange)
@@ -157,7 +159,13 @@ public sealed class PartyPanel
     private static string BuildConnectionTooltip(SyncConnectionInfo info, bool inParty)
     {
         var sb = new System.Text.StringBuilder();
-        sb.AppendLine("與網頁版共享房間的即時連線（成員／藏寶圖／隊伍設定共三條）。");
+        sb.AppendLine(info.Total == 0
+            ? "與網頁版共享房間的即時連線。"
+            : info.Single
+                ? "與網頁版共享房間的即時連線（成員／藏寶圖／隊伍設定合併成一條）。"
+                : "與網頁版共享房間的即時連線（成員／藏寶圖／隊伍設定共三條）。");
+        if (info.LastStatusCode == 402)
+            sb.AppendLine("cycleapple 伺服器同時連線已滿（免費方案上限 100），稍後自動重試。");
         sb.AppendLine(info.Total == 0
             ? (inParty ? "目前串流數: 0（訂閱不存在，可按「重新連線」重建）" : "目前串流數: 0（尚未加入隊伍）")
             : $"已連上 {info.Connected}/{info.Total} 條");
@@ -246,6 +254,17 @@ public sealed class PartyPanel
             ImGui.SetTooltip("開啟後，插件載入時若記得上次的隊伍代碼，會自動連線到同步伺服器並重新加入。\n"
                              + "關閉時（預設）載入插件不會連線，只有按「建立新隊伍」或「加入」才會連線。\n"
                              + "改這個選項不會立刻連線，下次載入插件才生效。");
+
+        var single = Plugin.Config.SingleStreamSync;
+        if (ImGui.Checkbox("同步合併成一條連線（建議）", ref single))
+        {
+            Plugin.Config.SingleStreamSync = single;
+            Plugin.Config.Save();
+        }
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("開啟（預設）時每人只佔同步伺服器 1 條連線，原本是 3 條；伺服器同時連線有上限，佔得越少越不容易被擋。\n"
+                             + "伺服器不准用一條連線讀整個隊伍時，會自動改回 3 條。\n"
+                             + "改這個選項下次建立／加入隊伍才生效。");
     }
 
     private static readonly System.Numerics.Vector4 ErrorColor = new(1f, 0.4f, 0.4f, 1f);

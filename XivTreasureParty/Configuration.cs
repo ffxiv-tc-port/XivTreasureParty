@@ -52,5 +52,11 @@ public class Configuration : IPluginConfiguration
     /// </summary>
     public bool NavigateWithFlight { get; set; } = true;
 
+    /// <summary>
+    /// 同步合併成一條串流（訂閱整個隊伍節點）；伺服器不准讀整個隊伍時自動改回成員／藏寶圖／隊伍設定三條。
+    /// 關掉＝一律三條（舊行為）。下次建立／加入隊伍才生效。
+    /// </summary>
+    public bool SingleStreamSync { get; set; } = true;
+
     public void Save() => Plugin.PluginInterface.SavePluginConfig(this);
 }
