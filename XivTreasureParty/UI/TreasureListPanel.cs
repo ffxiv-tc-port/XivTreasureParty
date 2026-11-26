@@ -14,10 +14,15 @@ public sealed class TreasureListPanel
     private int _editMode; // 0: none, 1: note, 2: player
     private bool _editJustStarted;
     private string _chatCommandBuf;
+    private string _templateBuf;
+    private bool _showTemplate;
+    private string? _previewKey;
+    private string _previewText = string.Empty;
 
     public TreasureListPanel()
     {
         _chatCommandBuf = NormalizeChatCommand(Plugin.Config.TreasureChatCommand);
+        _templateBuf = ChatTemplate.Sanitize(Plugin.Config.TreasureChatTemplate);
     }
 
     public void Draw()
@@ -38,6 +43,13 @@ public sealed class TreasureListPanel
             SaveChatCommand();
         if (ImGui.IsItemHovered())
             ImGui.SetTooltip("藏寶圖座標的發送頻道，例如 /p（小隊）或 /cwl1（跨界通訊貝 1）");
+        ImGui.SameLine();
+        if (ImGui.SmallButton(_showTemplate ? "收起訊息格式" : "訊息格式…"))
+            _showTemplate = !_showTemplate;
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("自訂按「發送」時送出的訊息內容（例如只送角色和地圖連結）");
+        if (_showTemplate)
+            DrawTemplateEditor();
 
         var showOnMappy = Plugin.Config.ShowTreasuresOnMappy;
         if (ImGui.Checkbox("藏寶圖標到 Mappy 地圖", ref showOnMappy))
@@ -283,7 +295,7 @@ public sealed class TreasureListPanel
     }
 
     /// <summary>
-    /// 對應網頁版 copyPlayerMessage，以玩家設定的頻道指令發送。**純文字座標** —
+    /// 以玩家設定的頻道指令＋訊息樣板發送（<see cref="ChatTemplate"/>）。預設樣板＝下面這種**純文字座標** —
     /// 含一個保險的 PreMapLinkPayload 在文字後面（給有裝 AutoConvertMapLink
     /// 等接收端 rewrite 工具的玩家可點），但即使 payload 被 input
     /// sanitizer 剝掉，文字部分的座標一定看得到。
@@ -298,29 +310,108 @@ public sealed class TreasureListPanel
     {
         try
         {
-            var mapName = MapData.GetMapName(t.MapId);
-            var aetheryte = AetheryteData.FindNearestByMapId(t.MapId, t.Coords.X, t.Coords.Y);
-            var player = string.IsNullOrWhiteSpace(t.Player) ? "" : t.Player + " ";
             var preLink = TreasureLocator.TryBuildAutoTranslateMapLink(t);
-
-            // 雙保險：純文字 + PreMapLinkPayload。
-            //  (U+E0BB) 是 FFXIV 旗標 PUA 字符，配合 regex 讓接收端 hook (本插件 / AutoConvertMapLink)
-            // 在「chunk 被 input sanitizer 吃掉」的情況下仍能把文字轉成可點連結。
-            // 接收端 hook 偵測到 chunk 已存在時會把多餘的純文字模式吃掉避免重複顯示。
-            var sb = new Dalamud.Game.Text.SeStringHandling.SeStringBuilder();
             var chatCommand = NormalizeChatCommand(Plugin.Config.TreasureChatCommand);
-            sb.AddText($"{chatCommand} {player}{mapName} ( {t.Coords.X:0.0}  , {t.Coords.Y:0.0} )");
-            if (preLink != null)
-                sb.Add(preLink);
-            if (aetheryte != null)
-                sb.AddText($" | 最近傳送水晶:[{aetheryte.Name}]");
+            var parts = ChatTemplate.Render(ChatTemplate.Sanitize(Plugin.Config.TreasureChatTemplate), TemplateValues(t, preLink != null));
 
-            Plugin.ChatSender.SendSeString(sb.Build());
+            var sb = new Dalamud.Game.Text.SeStringHandling.SeStringBuilder();
+            var prefix = chatCommand + " ";
+            foreach (var part in parts)
+            {
+                if (part.IsLink)
+                {
+                    if (prefix.Length > 0) { sb.AddText(prefix); prefix = string.Empty; }
+                    sb.Add(preLink!);
+                }
+                else
+                {
+                    sb.AddText(prefix + part.Text);
+                    prefix = string.Empty;
+                }
+            }
+            if (prefix.Length > 0) sb.AddText(prefix);
+
+            var message = sb.Build();
+            var bytes = message.Encode().Length;
+            if (bytes >= ChatTemplate.MaxMessageBytes)
+            {
+                Plugin.Log.Warning($"[SendTreasure] 訊息太長（{bytes} 位元組），沒有送出");
+                Plugin.ChatGui.PrintError($"[藏寶圖小幫手] 訊息太長（{bytes} 位元組，上限 {ChatTemplate.MaxMessageBytes - 1}），沒有送出；請縮短訊息樣板。");
+                return;
+            }
+            Plugin.ChatSender.SendSeString(message);
         }
         catch (Exception ex)
         {
             Plugin.Log.Error(ex, "[SendTreasure] 發送聊天失敗");
         }
+    }
+
+    private static ChatTemplate.Values TemplateValues(Treasure t, bool hasLink) => new(
+        string.IsNullOrWhiteSpace(t.Player) ? string.Empty : t.Player,
+        MapData.GetMapName(t.MapId),
+        t.Coords.X,
+        t.Coords.Y,
+        hasLink,
+        AetheryteData.FindNearestByMapId(t.MapId, t.Coords.X, t.Coords.Y)?.Name);
+
+    private void DrawTemplateEditor()
+    {
+        ImGui.TextUnformatted("訊息樣板（頻道指令固定放在最前面）");
+        ImGui.SetNextItemWidth(-1);
+        var committed = ImGui.InputText("##treasure-chat-template", ref _templateBuf, 512, ImGuiInputTextFlags.EnterReturnsTrue);
+        if (committed || ImGui.IsItemDeactivatedAfterEdit())
+            SaveTemplate(_templateBuf);
+
+        if (ImGui.SmallButton("完整（預設）"))
+            SaveTemplate(ChatTemplate.Default);
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("角色、地圖名與座標文字、地圖連結、最近傳送水晶（和以前一樣）");
+        ImGui.SameLine();
+        if (ImGui.SmallButton("最簡"))
+            SaveTemplate(ChatTemplate.Minimal);
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("只送「頻道指令 角色 地圖連結」。\n如果隊友那邊只看到名字、沒有連結，請改回完整格式。");
+
+        ImGui.TextDisabled("可用：" + string.Join(" ", ChatTemplate.Placeholders.Select(p => p.Token)));
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip(string.Join("\n", ChatTemplate.Placeholders.Select(p => $"{p.Token}：{p.Help}"))
+                             + "\n\n值是空的佔位符會連同旁邊一個空白一起省略。");
+
+        ImGui.PushTextWrapPos(0f);
+        ImGui.TextUnformatted("預覽：" + BuildPreview());
+        ImGui.PopTextWrapPos();
+    }
+
+    /// <summary>用目前清單的第一筆代入；樣板或那一筆沒變就沿用上次的結果。</summary>
+    private string BuildPreview()
+    {
+        var first = Plugin.PartyService.IsInParty
+            ? Plugin.SyncService.Treasures.Values.OrderBy(t => t.Completed).ThenBy(t => t.Order).FirstOrDefault()
+            : null;
+        if (first == null)
+            return "（清單有藏寶圖後，會用第一筆代入顯示）";
+
+        var template = ChatTemplate.Sanitize(Plugin.Config.TreasureChatTemplate);
+        var command = NormalizeChatCommand(Plugin.Config.TreasureChatCommand);
+        var key = $"{template}|{command}|{first.FirebaseKey}|{first.MapId}|{first.Coords.X}|{first.Coords.Y}|{first.Player}";
+        if (key != _previewKey)
+        {
+            _previewKey = key;
+            var hasLink = TreasureLocator.TryBuildAutoTranslateMapLink(first) != null;
+            _previewText = ChatTemplate.Preview(command, ChatTemplate.Render(template, TemplateValues(first, hasLink)));
+        }
+        return _previewText;
+    }
+
+    private void SaveTemplate(string template)
+    {
+        var sanitized = ChatTemplate.Sanitize(template);
+        _templateBuf = sanitized;
+        if (Plugin.Config.TreasureChatTemplate == sanitized)
+            return;
+        Plugin.Config.TreasureChatTemplate = sanitized;
+        Plugin.Config.Save();
     }
 
     private void SaveChatCommand()
